@@ -2552,6 +2552,7 @@ dependencies = [
  "glow",
  "glutin",
  "glutin-winit",
+ "png",
  "raw-window-handle",
  "wayland-client",
  "wayland-protocols-wlr",

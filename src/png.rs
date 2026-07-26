@@ -1,114 +1,42 @@
-//! A minimal PNG encoder.
+//! PNG encoding for the clipboard.
 //!
-//! Only needed so images can be handed to external clipboard helpers, which
-//! want `image/png` bytes. Deflate is emitted as *stored* (uncompressed) blocks:
-//! that is a legal zlib stream every decoder accepts, costs about 100 lines,
-//! and avoids taking on a compression dependency for a clipboard payload that
-//! never touches disk.
+//! The external clipboard helpers want `image/png` bytes. Encoding is delegated
+//! to the `png` crate, which `arboard` and `xcap` already pull in through
+//! `image` — so naming it directly costs nothing and buys real deflate
+//! compression instead of the stored (uncompressed) blocks this module used to
+//! emit by hand.
+
+use ::png::{BitDepth, ColorType, Encoder};
 
 use crate::image::Rgba8;
 
-/// The largest payload a single stored deflate block can hold.
-const MAX_STORED_BLOCK: usize = u16::MAX as usize;
-
 /// Encodes an image as PNG bytes.
-pub fn encode(image: &Rgba8) -> Vec<u8> {
+pub fn encode(image: &Rgba8) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
 
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(image.width() as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(image.height() as u32).to_be_bytes());
-    ihdr.push(8); // bit depth
-    ihdr.push(6); // colour type: truecolour with alpha
-    ihdr.push(0); // deflate
-    ihdr.push(0); // adaptive filtering
-    ihdr.push(0); // no interlacing
-    write_chunk(&mut out, b"IHDR", &ihdr);
+    let mut encoder = Encoder::new(&mut out, image.width() as u32, image.height() as u32);
+    encoder.set_color(ColorType::Rgba);
+    encoder.set_depth(BitDepth::Eight);
 
-    write_chunk(&mut out, b"IDAT", &zlib_stored(&raw_scanlines(image)));
-    write_chunk(&mut out, b"IEND", &[]);
-    out
-}
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("cannot write the PNG header: {e}"))?;
+    writer
+        .write_image_data(image.as_bytes())
+        .map_err(|e| format!("cannot write the PNG data: {e}"))?;
+    writer
+        .finish()
+        .map_err(|e| format!("cannot finish the PNG stream: {e}"))?;
 
-/// Prefixes each row with a filter byte, as the PNG format requires.
-fn raw_scanlines(image: &Rgba8) -> Vec<u8> {
-    let width = image.width();
-    let stride = width * 4;
-    let bytes = image.as_bytes();
-    let mut out = Vec::with_capacity((stride + 1) * image.height());
-    for row in 0..image.height() {
-        out.push(0); // filter type 0: none
-        out.extend_from_slice(&bytes[row * stride..(row + 1) * stride]);
-    }
-    out
-}
-
-/// Wraps data in a zlib stream built from stored deflate blocks.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() + data.len() / MAX_STORED_BLOCK * 5 + 16);
-    // zlib header: deflate, 32K window, no preset dictionary, default level.
-    out.push(0x78);
-    out.push(0x01);
-
-    if data.is_empty() {
-        out.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0xFF]);
-    } else {
-        for (index, chunk) in data.chunks(MAX_STORED_BLOCK).enumerate() {
-            let is_last = (index + 1) * MAX_STORED_BLOCK >= data.len();
-            out.push(u8::from(is_last));
-            let len = chunk.len() as u16;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(&(!len).to_le_bytes());
-            out.extend_from_slice(chunk);
-        }
-    }
-
-    out.extend_from_slice(&adler32(data).to_be_bytes());
-    out
-}
-
-fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-
-    // The CRC covers the type and the data, which are already contiguous at the
-    // end of `out` — checksum them in place rather than copying the whole
-    // payload into a second buffer just to hash it.
-    let checksummed = out.len() - kind.len() - data.len();
-    let crc = crc32(&out[checksummed..]);
-    out.extend_from_slice(&crc.to_be_bytes());
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for byte in data {
-        crc ^= *byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    const MOD: u32 = 65521;
-    let (mut a, mut b) = (1u32, 0u32);
-    for byte in data {
-        a = (a + *byte as u32) % MOD;
-        b = (b + a) % MOD;
-    }
-    (b << 16) | a
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn solid(width: usize, height: usize) -> Rgba8 {
-        let mut pixels = Vec::new();
+    fn gradient(width: usize, height: usize) -> Rgba8 {
+        let mut pixels = Vec::with_capacity(width * height * 4);
         for y in 0..height {
             for x in 0..width {
                 pixels.extend_from_slice(&[x as u8, y as u8, 128, 255]);
@@ -117,78 +45,55 @@ mod tests {
         Rgba8::from_raw(width, height, pixels).expect("valid buffer")
     }
 
+    /// Decodes `bytes` back into raw RGBA, so the tests assert against what a
+    /// clipboard consumer would actually see rather than our own byte layout.
+    fn decode(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+        let decoder = ::png::Decoder::new(std::io::Cursor::new(bytes));
+        let mut reader = decoder.read_info().expect("valid PNG");
+        let mut buffer = vec![0; reader.output_buffer_size().expect("known size")];
+        let info = reader.next_frame(&mut buffer).expect("decodable frame");
+        buffer.truncate(info.buffer_size());
+        (info.width, info.height, buffer)
+    }
+
     #[test]
     fn output_starts_with_the_png_signature() {
-        let bytes = encode(&solid(4, 4));
+        let bytes = encode(&gradient(4, 4)).expect("encodes");
         assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     }
 
     #[test]
-    fn the_header_records_the_image_dimensions() {
-        let bytes = encode(&solid(7, 3));
-        // IHDR data starts at byte 16: 8 signature + 4 length + 4 type.
-        assert_eq!(&bytes[16..20], &7u32.to_be_bytes());
-        assert_eq!(&bytes[20..24], &3u32.to_be_bytes());
-        assert_eq!(bytes[24], 8, "bit depth");
-        assert_eq!(bytes[25], 6, "RGBA colour type");
+    fn pixels_survive_a_round_trip_unchanged() {
+        let image = gradient(7, 3);
+        let (width, height, pixels) = decode(&encode(&image).expect("encodes"));
+
+        assert_eq!((width, height), (7, 3));
+        assert_eq!(pixels, image.as_bytes(), "RGBA data changed in transit");
     }
 
     #[test]
-    fn all_three_required_chunks_are_present_and_ordered() {
-        let bytes = encode(&solid(4, 4));
-        let ihdr = find(&bytes, b"IHDR").expect("IHDR");
-        let idat = find(&bytes, b"IDAT").expect("IDAT");
-        let iend = find(&bytes, b"IEND").expect("IEND");
-        assert!(ihdr < idat && idat < iend, "chunks out of order");
-        assert!(bytes.ends_with(&crc32(b"IEND").to_be_bytes()));
+    fn a_payload_larger_than_one_deflate_block_round_trips() {
+        // Three rows of 40000 px comfortably exceeds the 65535-byte cap on a
+        // single stored block, which is where the previous hand-rolled encoder
+        // had to split. The crate must handle the split transparently.
+        let image = gradient(40_000, 3);
+        let (width, height, pixels) = decode(&encode(&image).expect("encodes"));
+
+        assert_eq!((width, height), (40_000, 3));
+        assert_eq!(pixels, image.as_bytes());
     }
 
     #[test]
-    fn known_checksums_match_the_reference_values() {
-        // Standard test vectors for both algorithms.
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-        assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
-        assert_eq!(adler32(b""), 1);
-    }
-
-    #[test]
-    fn a_payload_larger_than_one_block_is_split_and_terminated() {
-        // Three rows of 40000 px comfortably exceeds the 65535-byte block cap.
-        let wide = solid(40_000, 3);
-        let scanlines = raw_scanlines(&wide);
-        assert!(scanlines.len() > MAX_STORED_BLOCK * 2);
-
-        let stream = zlib_stored(&scanlines);
-        // Walk the block headers and check exactly the final one is flagged.
-        let mut offset = 2;
-        let mut blocks = 0;
-        loop {
-            let is_last = stream[offset] == 1;
-            let len = u16::from_le_bytes([stream[offset + 1], stream[offset + 2]]) as usize;
-            let nlen = u16::from_le_bytes([stream[offset + 3], stream[offset + 4]]);
-            assert_eq!(nlen, !(len as u16), "block length complement is wrong");
-            offset += 5 + len;
-            blocks += 1;
-            if is_last {
-                break;
-            }
-            assert!(offset < stream.len(), "ran past the end without a final block");
-        }
-        assert!(blocks > 1, "expected the payload to be split");
-        assert_eq!(offset + 4, stream.len(), "adler32 should follow the last block");
-    }
-
-    #[test]
-    fn each_scanline_carries_a_filter_byte() {
-        let image = solid(3, 2);
-        let scanlines = raw_scanlines(&image);
-        assert_eq!(scanlines.len(), (3 * 4 + 1) * 2);
-        assert_eq!(scanlines[0], 0, "row 0 filter byte");
-        assert_eq!(scanlines[13], 0, "row 1 filter byte");
-    }
-
-    /// Finds a chunk type marker in the encoded stream.
-    fn find(bytes: &[u8], kind: &[u8; 4]) -> Option<usize> {
-        bytes.windows(4).position(|w| w == kind)
+    fn compression_beats_the_raw_pixel_size() {
+        // A flat image is highly compressible; stored blocks could never shrink
+        // it, so this also guards against silently regressing to no deflate.
+        let image = gradient(256, 256);
+        let encoded = encode(&image).expect("encodes");
+        assert!(
+            encoded.len() < image.as_bytes().len() / 2,
+            "expected real compression, got {} bytes for {} raw",
+            encoded.len(),
+            image.as_bytes().len()
+        );
     }
 }

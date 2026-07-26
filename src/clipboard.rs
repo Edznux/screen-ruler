@@ -73,7 +73,12 @@ fn linux_copy_text(text: &str) -> Option<Result<(), String>> {
 /// Copies a PNG with whichever Linux clipboard helper is installed.
 #[cfg(target_os = "linux")]
 fn linux_copy_image(image: &Rgba8) -> Option<Result<(), String>> {
-    try_helpers(&IMAGE_HELPERS, &crate::png::encode(image))
+    match crate::png::encode(image) {
+        Ok(png) => try_helpers(&IMAGE_HELPERS, &png),
+        // Encoding failed, so no helper could succeed; report it rather than
+        // falling through to arboard with the same doomed payload.
+        Err(reason) => Some(Err(reason)),
+    }
 }
 
 /// Feeds `payload` to the first helper that is installed, preferring the one

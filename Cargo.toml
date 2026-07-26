@@ -33,6 +33,11 @@ glow = "0.16"
 xcap = "0.9"
 arboard = { version = "3.6", default-features = false, features = ["image-data", "wayland-data-control"] }
 
+# PNG encoding for the external clipboard helpers, which want image/png bytes.
+# Already in the tree via arboard and xcap (both depend on `image`), so naming
+# it directly adds no crates to the build.
+png = "0.18"
+
 # Wayland screen capture is implemented natively against wlr-screencopy rather
 # than delegated to xcap, whose shm path fails on wlroots compositors. Both
 # crates are already in the tree via winit, so this costs no extra dependencies.
