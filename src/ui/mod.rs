@@ -9,7 +9,7 @@ pub mod overlay;
 pub mod panel;
 pub mod theme;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use egui::{Color32, Context, Key, Pos2, Rect, Vec2};
 
@@ -19,8 +19,15 @@ use crate::surface::Surface;
 
 /// A drag shorter than this counts as a click, not a selection.
 const DRAG_THRESHOLD: f32 = 2.0;
-/// How long the edge map is flashed after a sensitivity change.
-const EDGE_PREVIEW: Duration = Duration::from_millis(1000);
+/// Number keys that select a mode, in [`Mode::ALL`] order.
+const MODE_KEYS: [Key; 6] = [
+    Key::Num1,
+    Key::Num2,
+    Key::Num3,
+    Key::Num4,
+    Key::Num5,
+    Key::Num6,
+];
 
 /// Everything one window needs to render a frame.
 pub struct FrameContext<'a> {
@@ -150,13 +157,7 @@ fn refresh_derived(
     state.container = if state.mode == Mode::Container {
         surface
             .container_at_logical(pointer.x, pointer.y)
-            .map(|r| crate::state::Rect {
-                monitor,
-                x: r.x,
-                y: r.y,
-                width: r.width,
-                height: r.height,
-            })
+            .map(|rect| rect.on_monitor(monitor))
     } else {
         None
     };
@@ -178,8 +179,9 @@ fn refresh_derived(
 
     // Snapping only assists the modes that place geometry by hand.
     state.snapped = if matches!(state.mode, Mode::RectDrag | Mode::Distance) {
-        let (x, y, snapped) = surface.snap_logical(pointer.x, pointer.y, state.snap_distance);
-        Some((Point { monitor, x, y }, snapped))
+        surface
+            .snap_logical(pointer.x, pointer.y, state.snap_distance)
+            .map(|(x, y)| Point { monitor, x, y })
     } else {
         None
     };
@@ -187,10 +189,15 @@ fn refresh_derived(
 
 /// The point a placement should use: the snapped one when snapping applies.
 fn placement_point(state: &RulerState) -> Option<Point> {
-    match state.snapped {
-        Some((point, true)) => Some(point),
-        _ => state.pointer,
-    }
+    state.snapped.or(state.pointer)
+}
+
+/// The egui rectangle for a monitor-local logical rect.
+fn egui_rect(rect: &crate::state::Rect) -> Rect {
+    Rect::from_min_size(
+        Pos2::new(rect.x, rect.y),
+        Vec2::new(rect.width, rect.height),
+    )
 }
 
 /// Folds keyboard and pointer input into the shared state.
@@ -221,15 +228,10 @@ fn handle_input(
     });
 
     if scroll != 0.0 {
-        // egui reports roughly 50 logical px of scroll per wheel notch.
+        // egui reports roughly 50 logical px of scroll per wheel notch. When
+        // the wheel drives sensitivity, `set_sensitivity` arms the edge preview.
         let notches = (scroll / 50.0).round().clamp(-5.0, 5.0);
         state.adjust_by_wheel(notches);
-        if !matches!(
-            state.mode,
-            Mode::RectDrag | Mode::ShrinkToFit | Mode::ColorPicker
-        ) {
-            state.edge_preview_until = Some(Instant::now() + EDGE_PREVIEW);
-        }
     }
 
     let Some(pointer) = state.pointer else { return };
@@ -474,14 +476,16 @@ fn handle_keys(ctx: &Context, state: &mut RulerState, surface: &Surface, monitor
     });
 
     for key in keys {
-        match key {
-            Key::Num1 => state.set_mode(Mode::Crosshair),
-            Key::Num2 => state.set_mode(Mode::RectDrag),
-            Key::Num3 => state.set_mode(Mode::Container),
-            Key::Num4 => state.set_mode(Mode::ShrinkToFit),
-            Key::Num5 => state.set_mode(Mode::ColorPicker),
-            Key::Num6 => state.set_mode(Mode::Distance),
+        // The number keys and `Mode::ALL` are one ordering, not two: the
+        // tooltip shows `mode.index() + 1`, so they cannot be allowed to drift.
+        if let Some(index) = MODE_KEYS.iter().position(|k| *k == key) {
+            if let Some(mode) = Mode::from_index(index) {
+                state.set_mode(mode);
+            }
+            continue;
+        }
 
+        match key {
             Key::Tab => {
                 if state.session {
                     state.request_destructive(Destructive::ToggleSession);
@@ -578,10 +582,7 @@ fn paint_overlay(
 
         if state.export_armed {
             if let Some(rect) = state.export_drag.rect() {
-                shapes.push(overlay::selection_rect(Rect::from_min_size(
-                    Pos2::new(rect.x, rect.y),
-                    Vec2::new(rect.width, rect.height),
-                )));
+                shapes.push(overlay::selection_rect(egui_rect(&rect)));
             }
             return shapes;
         }
@@ -605,21 +606,17 @@ fn paint_overlay(
                 ));
             }
             Mode::RectDrag | Mode::ShrinkToFit | Mode::Container => {
-                if let Some((snapped, true)) = state.snapped {
+                if let Some(snapped) = state.snapped {
                     shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
                 }
-                let live = state
-                    .active_rect()
-                    .or_else(|| state.drag.active.then(|| state.drag.rect()).flatten());
-                if let Some(rect) = live {
-                    let egui_rect = Rect::from_min_size(
-                        Pos2::new(rect.x, rect.y),
-                        Vec2::new(rect.width, rect.height),
-                    );
-                    shapes.push(overlay::selection_rect(egui_rect));
+                // `DragState::rect` already reports only a live or finished
+                // selection, so no extra gate is needed here.
+                if let Some(rect) = state.active_rect().or_else(|| state.drag.rect()) {
+                    let bounds = egui_rect(&rect);
+                    shapes.push(overlay::selection_rect(bounds));
                     shapes.extend(overlay::measurement_label(
                         fonts,
-                        egui_rect.min,
+                        bounds.min,
                         &crate::state::format_size(rect.width, rect.height),
                         overlay::label_offset(),
                         canvas,
@@ -633,14 +630,14 @@ fn paint_overlay(
                     shapes.extend(overlay::color_bubble(
                         fonts,
                         at,
-                        [sample.hex(), sample.rgb(), sample.hsl()],
+                        sample.notations(),
                         Color32::from_rgb(sample.r, sample.g, sample.b),
                         canvas,
                     ));
                 }
             }
             Mode::Distance => {
-                if let Some((snapped, true)) = state.snapped {
+                if let Some(snapped) = state.snapped {
                     shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
                 }
                 if let Some(anchor) = state.distance_anchor {

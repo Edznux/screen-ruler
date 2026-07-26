@@ -230,9 +230,20 @@ impl App {
                 .desktop
                 .surface(index)
                 .ok_or_else(|| format!("no captured surface for monitor {index}"))?;
+            let (backdrop, downscaled) = to_color_image(&surface.image, max_texture_side);
+            if let Some(factor) = downscaled {
+                eprintln!(
+                    "screen-ruler: {} is {}x{} but this driver caps textures at \
+                     {max_texture_side}; showing the backdrop at 1/{factor} scale \
+                     (measurements are unaffected).",
+                    geometry.name,
+                    surface.image.width(),
+                    surface.image.height()
+                );
+            }
             let screenshot = egui_ctx.load_texture(
                 format!("screenshot-{index}"),
-                to_color_image(&surface.image, max_texture_side, &geometry.name),
+                backdrop,
                 egui::TextureOptions::NEAREST,
             );
 
@@ -289,10 +300,12 @@ impl App {
 
             let size = overlay.window.inner_size();
             let scale_factor = overlay.window.scale_factor() as f32;
-            if size.width > 0 && scale_factor > 0.0 {
+            if scale_factor > 0.0 {
                 let logical_width = size.width as f32 / scale_factor;
-                if logical_width > 0.0 {
-                    geometry.scale = surface.image.width() as f32 / logical_width;
+                if let Some(scale) =
+                    crate::geometry::scale_from_widths(surface.image.width(), logical_width)
+                {
+                    geometry.scale = scale;
                 }
             }
 
@@ -424,15 +437,16 @@ impl App {
     }
 
     /// Re-analyses every monitor after a sensitivity change.
+    ///
+    /// The edge preview is armed by `set_sensitivity`, which is the only thing
+    /// that can queue this command.
     fn recompute(&mut self) {
         let (low, high) = edges::sensitivity_to_thresholds(self.state.sensitivity);
         self.desktop.recompute(low, high);
         for overlay in self.windows.values_mut() {
             overlay.edge_texture_stale = true;
         }
-        self.state.edge_preview_until = Some(Instant::now() + Duration::from_millis(1000));
     }
-
 }
 
 impl ApplicationHandler for App {
@@ -545,31 +559,28 @@ fn match_monitor(
 ///
 /// Only the displayed backdrop loses fidelity: measurements are cast against
 /// the full-resolution edge map, so a downscale costs sharpness, not accuracy.
+/// Returns the image alongside the downscale factor applied, if any, so the
+/// caller can explain the reduction rather than this converter printing it.
 fn to_color_image(
     image: &crate::image::Rgba8,
     max_texture_side: usize,
-    monitor: &str,
-) -> egui::ColorImage {
+) -> (egui::ColorImage, Option<usize>) {
     let longest = image.width().max(image.height());
     if longest <= max_texture_side || max_texture_side == 0 {
-        return egui::ColorImage::from_rgba_unmultiplied(
+        let full = egui::ColorImage::from_rgba_unmultiplied(
             [image.width(), image.height()],
             image.as_bytes(),
         );
+        return (full, None);
     }
 
     let factor = longest.div_ceil(max_texture_side);
-    eprintln!(
-        "screen-ruler: {monitor} is {}x{} but this driver caps textures at {max_texture_side}; \
-         showing the backdrop at 1/{factor} scale (measurements are unaffected).",
-        image.width(),
-        image.height()
-    );
     let reduced = image.downscale(factor);
-    egui::ColorImage::from_rgba_unmultiplied(
+    let scaled = egui::ColorImage::from_rgba_unmultiplied(
         [reduced.width(), reduced.height()],
         reduced.as_bytes(),
-    )
+    );
+    (scaled, Some(factor))
 }
 
 /// Renders an edge map as a white-on-transparent image for the debug overlay.

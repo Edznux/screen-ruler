@@ -57,15 +57,9 @@ impl RegionMap {
             }
 
             let label = stats.len() as u32;
-            let mut bounds = RegionStats {
-                x: seed % w,
-                y: seed / w,
-                width: 1,
-                height: 1,
-                area: 0,
-            };
             let (mut min_x, mut max_x) = (seed % w, seed % w);
             let (mut min_y, mut max_y) = (seed / w, seed / w);
+            let mut area = 0usize;
 
             labels[seed] = label;
             stack.push(seed);
@@ -75,7 +69,7 @@ impl RegionMap {
             while let Some(idx) = stack.pop() {
                 let x = idx % w;
                 let y = idx / w;
-                bounds.area += 1;
+                area += 1;
                 min_x = min_x.min(x);
                 max_x = max_x.max(x);
                 min_y = min_y.min(y);
@@ -101,11 +95,13 @@ impl RegionMap {
                 }
             }
 
-            bounds.x = min_x;
-            bounds.y = min_y;
-            bounds.width = max_x - min_x + 1;
-            bounds.height = max_y - min_y + 1;
-            stats.push(bounds);
+            stats.push(RegionStats {
+                x: min_x,
+                y: min_y,
+                width: max_x - min_x + 1,
+                height: max_y - min_y + 1,
+                area,
+            });
         }
 
         Self {
@@ -116,8 +112,8 @@ impl RegionMap {
         }
     }
 
-    /// Number of labelled regions. Used by tests.
-    #[allow(dead_code)]
+    /// Number of labelled regions.
+    #[cfg(test)]
     pub fn region_count(&self) -> usize {
         self.stats.len().saturating_sub(1)
     }
@@ -202,36 +198,55 @@ impl RegionMap {
 /// so a leaky container does not merge with the whole desktop.
 fn morphological_close(edges: &EdgeMap) -> Vec<bool> {
     let (w, h) = (edges.width(), edges.height());
-    let dilated = morph_pass(w, h, |x, y| edges.at(x, y), true);
-    morph_pass(w, h, |x, y| dilated[y * w + x], false)
+    let dilated = morph_pass(edges.as_slice(), w, h, true);
+    morph_pass(&dilated, w, h, false)
 }
 
-/// One 3x3 morphology pass. `dilate` selects OR-of-neighbourhood, otherwise
-/// AND-of-neighbourhood (erosion). Out-of-bounds neighbours are treated as
-/// set, so erosion does not eat the image border.
-fn morph_pass(w: usize, h: usize, src: impl Fn(usize, usize) -> bool, dilate: bool) -> Vec<bool> {
-    let mut out = vec![false; w * h];
-    let r = CLOSE_KERNEL_RADIUS as isize;
+/// One square-kernel morphology pass. `dilate` selects OR-of-neighbourhood,
+/// otherwise AND-of-neighbourhood (erosion). Out-of-bounds neighbours are
+/// treated as set, so erosion does not eat the image border.
+///
+/// A square structuring element is separable, so this runs a horizontal pass
+/// then a vertical one: six neighbour reads per pixel rather than nine, over
+/// buffers the size of the whole framebuffer.
+fn morph_pass(src: &[bool], w: usize, h: usize, dilate: bool) -> Vec<bool> {
+    let outside = !dilate;
+    let combine = |a: bool, b: bool| if dilate { a | b } else { a & b };
+    let r = CLOSE_KERNEL_RADIUS;
+
+    let mut horizontal = vec![false; w * h];
     for y in 0..h {
+        let row = y * w;
         for x in 0..w {
-            let mut acc = !dilate;
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    let nx = x as isize + dx;
-                    let ny = y as isize + dy;
-                    let value = if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
-                        !dilate
-                    } else {
-                        src(nx as usize, ny as usize)
-                    };
-                    if dilate {
-                        acc |= value;
-                    } else {
-                        acc &= value;
-                    }
-                }
+            let mut acc = src[row + x];
+            for offset in 1..=r {
+                let left = if x >= offset { src[row + x - offset] } else { outside };
+                let right = if x + offset < w { src[row + x + offset] } else { outside };
+                acc = combine(combine(acc, left), right);
             }
-            out[y * w + x] = acc;
+            horizontal[row + x] = acc;
+        }
+    }
+
+    let mut out = vec![false; w * h];
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..w {
+            let mut acc = horizontal[row + x];
+            for offset in 1..=r {
+                let up = if y >= offset {
+                    horizontal[row - offset * w + x]
+                } else {
+                    outside
+                };
+                let down = if y + offset < h {
+                    horizontal[row + offset * w + x]
+                } else {
+                    outside
+                };
+                acc = combine(combine(acc, up), down);
+            }
+            out[row + x] = acc;
         }
     }
     out
@@ -240,18 +255,6 @@ fn morph_pass(w: usize, h: usize, src: impl Fn(usize, usize) -> bool, dilate: bo
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Builds an edge map from ASCII art where `#` marks an edge pixel.
-    fn edges_from(rows: &[&str]) -> EdgeMap {
-        let h = rows.len();
-        let w = rows[0].len();
-        let mut data = Vec::with_capacity(w * h);
-        for row in rows {
-            assert_eq!(row.len(), w, "ragged test fixture");
-            data.extend(row.chars().map(|c| c == '#'));
-        }
-        EdgeMap::new(w, h, data).expect("valid map")
-    }
 
     /// Draws a 1px rectangle border on a 24x18 map.
     ///
@@ -331,7 +334,7 @@ mod tests {
 
     #[test]
     fn full_screen_backdrop_is_not_reported_as_a_container() {
-        let empty = edges_from(&["....", "....", "....", "...."]);
+        let empty = EdgeMap::from_ascii(&["....", "....", "....", "...."]);
         let regions = RegionMap::build(&empty);
         assert_eq!(regions.region_count(), 1);
         assert!(regions.container_at(1, 1).is_none());

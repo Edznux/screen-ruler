@@ -37,15 +37,15 @@ pub struct Rays {
 }
 
 impl Rays {
-    /// Total horizontal span between the west and east edges. Used by tests;
-    /// the UI reports spans through `LogicalRays` instead.
-    #[allow(dead_code)]
+    /// Total horizontal span between the west and east edges. The UI reports
+    /// spans through `LogicalRays` instead, so this exists for the tests.
+    #[cfg(test)]
     pub fn width(self) -> usize {
         self.west + self.east
     }
 
-    /// Total vertical span between the north and south edges. Used by tests.
-    #[allow(dead_code)]
+    /// Total vertical span between the north and south edges.
+    #[cfg(test)]
     pub fn height(self) -> usize {
         self.north + self.south
     }
@@ -90,28 +90,24 @@ pub fn cast_rays(edges: &EdgeMap, x: usize, y: usize) -> Rays {
     }
 }
 
-/// Result of pulling a loose point onto nearby edges.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Snap {
-    pub x: usize,
-    pub y: usize,
-    /// True when at least one axis actually moved.
-    pub snapped: bool,
-}
-
 /// Pulls `(x, y)` onto the nearest edge within `radius` device pixels.
+///
+/// Returns `None` when neither axis found an edge to snap to; otherwise the
+/// snapped point, which may have moved on only one axis.
 ///
 /// The axes snap independently: a point beside a vertical rule snaps in x while
 /// keeping its y, which is what makes dragging a selection onto a UI border feel
 /// predictable. `band` widens the perpendicular search so a near-miss on a
 /// slightly diagonal edge still registers; pass the monitor scale factor.
-pub fn snap_to_edge(edges: &EdgeMap, x: usize, y: usize, radius: usize, band: usize) -> Snap {
+pub fn snap_to_edge(
+    edges: &EdgeMap,
+    x: usize,
+    y: usize,
+    radius: usize,
+    band: usize,
+) -> Option<(usize, usize)> {
     if edges.is_empty() || radius == 0 {
-        return Snap {
-            x,
-            y,
-            snapped: false,
-        };
+        return None;
     }
 
     let max_x = edges.width() - 1;
@@ -125,33 +121,30 @@ pub fn snap_to_edge(edges: &EdgeMap, x: usize, y: usize, radius: usize, band: us
     let col_min = x.saturating_sub(band);
     let col_max = (x + band).min(max_x);
 
-    // Nearest column carrying an edge within the horizontal band.
-    let mut best_x: Option<usize> = None;
-    for candidate in x.saturating_sub(radius)..=(x + radius).min(max_x) {
-        if edges.any_in_column(candidate, row_min, row_max) {
-            let closer = best_x.is_none_or(|best| candidate.abs_diff(x) < best.abs_diff(x));
-            if closer {
-                best_x = Some(candidate);
-            }
-        }
-    }
+    let best_x = nearest(x, radius, max_x, |candidate| {
+        edges.any_in_column(candidate, row_min, row_max)
+    });
+    let best_y = nearest(y, radius, max_y, |candidate| {
+        edges.any_in_row(candidate, col_min, col_max)
+    });
 
-    // Nearest row carrying an edge within the vertical band.
-    let mut best_y: Option<usize> = None;
-    for candidate in y.saturating_sub(radius)..=(y + radius).min(max_y) {
-        if edges.any_in_row(candidate, col_min, col_max) {
-            let closer = best_y.is_none_or(|best| candidate.abs_diff(y) < best.abs_diff(y));
-            if closer {
-                best_y = Some(candidate);
-            }
-        }
+    if best_x.is_none() && best_y.is_none() {
+        return None;
     }
+    Some((best_x.unwrap_or(x), best_y.unwrap_or(y)))
+}
 
-    Snap {
-        x: best_x.unwrap_or(x),
-        y: best_y.unwrap_or(y),
-        snapped: best_x.is_some() || best_y.is_some(),
-    }
+/// Nearest index within `radius` of `origin` (capped at `max`) that `hit`
+/// accepts, searching outward so the first match is the closest one.
+///
+/// Ties resolve to the lower index, which keeps snapping stable when an edge
+/// sits equidistant on both sides.
+fn nearest(origin: usize, radius: usize, max: usize, hit: impl Fn(usize) -> bool) -> Option<usize> {
+    (0..=radius).find_map(|offset| {
+        let below = (offset <= origin).then(|| origin - offset);
+        let above = (offset > 0 && origin + offset <= max).then(|| origin + offset);
+        below.into_iter().chain(above).find(|c| hit(*c))
+    })
 }
 
 /// An inclusive rectangle in device pixels.
@@ -232,20 +225,9 @@ pub fn shrink_to_content(edges: &EdgeMap, rect: PixelRect) -> PixelRect {
 mod tests {
     use super::*;
 
-    fn edges_from(rows: &[&str]) -> EdgeMap {
-        let h = rows.len();
-        let w = rows[0].len();
-        let mut data = Vec::with_capacity(w * h);
-        for row in rows {
-            assert_eq!(row.len(), w, "ragged test fixture");
-            data.extend(row.chars().map(|c| c == '#'));
-        }
-        EdgeMap::new(w, h, data).expect("valid map")
-    }
-
     #[test]
     fn ray_stops_on_the_first_edge() {
-        let edges = edges_from(&[
+        let edges = EdgeMap::from_ascii(&[
             "..........",
             "..........",
             "..#....#..",
@@ -258,7 +240,7 @@ mod tests {
 
     #[test]
     fn ray_runs_to_the_boundary_when_unobstructed() {
-        let edges = edges_from(&["....", "....", "....", "...."]);
+        let edges = EdgeMap::from_ascii(&["....", "....", "....", "...."]);
         assert_eq!(trace_ray(&edges, 1, 1, Direction::West), 1);
         assert_eq!(trace_ray(&edges, 1, 1, Direction::East), 2);
         assert_eq!(trace_ray(&edges, 1, 1, Direction::North), 1);
@@ -268,13 +250,13 @@ mod tests {
     #[test]
     fn ray_ignores_an_edge_under_the_cursor_itself() {
         // Standing on an edge must still measure the surrounding span.
-        let edges = edges_from(&["#..#"]);
+        let edges = EdgeMap::from_ascii(&["#..#"]);
         assert_eq!(trace_ray(&edges, 0, 0, Direction::East), 3);
     }
 
     #[test]
     fn casting_all_rays_reports_span_totals() {
-        let edges = edges_from(&[
+        let edges = EdgeMap::from_ascii(&[
             "..#....",
             ".......",
             "#.....#",
@@ -293,42 +275,37 @@ mod tests {
     #[test]
     fn snapping_pulls_each_axis_independently() {
         // A vertical rule at x == 4 and nothing horizontal nearby.
-        let edges = edges_from(&[
+        let edges = EdgeMap::from_ascii(&[
             "....#.....",
             "....#.....",
             "....#.....",
             "....#.....",
             "....#.....",
         ]);
-        let snap = snap_to_edge(&edges, 6, 2, 5, 1);
-        assert!(snap.snapped);
-        assert_eq!(snap.x, 4, "x should snap onto the rule");
-        assert_eq!(snap.y, 2, "y has no edge to snap to and must stay put");
+        let snap = snap_to_edge(&edges, 6, 2, 5, 1).expect("expected a snap");
+        assert_eq!(snap.0, 4, "x should snap onto the rule");
+        assert_eq!(snap.1, 2, "y has no edge to snap to and must stay put");
     }
 
     #[test]
     fn snapping_prefers_the_nearest_edge() {
-        let edges = edges_from(&["#....#...."]);
-        let snap = snap_to_edge(&edges, 4, 0, 5, 1);
-        assert_eq!(snap.x, 5);
+        let edges = EdgeMap::from_ascii(&["#....#...."]);
+        let snap = snap_to_edge(&edges, 4, 0, 5, 1).expect("expected a snap");
+        assert_eq!(snap.0, 5);
     }
 
     #[test]
     fn snapping_is_a_no_op_outside_the_radius() {
-        let edges = edges_from(&["#........."]);
-        let snap = snap_to_edge(&edges, 8, 0, 3, 1);
-        assert!(!snap.snapped);
-        assert_eq!((snap.x, snap.y), (8, 0));
+        let edges = EdgeMap::from_ascii(&["#........."]);
+        assert_eq!(snap_to_edge(&edges, 8, 0, 3, 1), None);
 
         // A zero radius disables snapping entirely.
-        let disabled = snap_to_edge(&edges, 1, 0, 0, 1);
-        assert!(!disabled.snapped);
-        assert_eq!(disabled.x, 1);
+        assert_eq!(snap_to_edge(&edges, 1, 0, 0, 1), None);
     }
 
     #[test]
     fn shrink_tightens_onto_content() {
-        let edges = edges_from(&[
+        let edges = EdgeMap::from_ascii(&[
             "..........",
             "..........",
             "...####...",
@@ -357,7 +334,7 @@ mod tests {
 
     #[test]
     fn shrink_leaves_empty_or_tiny_rects_alone() {
-        let blank = edges_from(&[
+        let blank = EdgeMap::from_ascii(&[
             "..........",
             "..........",
             "..........",

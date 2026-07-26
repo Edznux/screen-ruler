@@ -5,8 +5,8 @@ use egui::{
     Ui, Vec2,
 };
 
-use crate::state::{Mode, RulerState, COLOR_RADIUS_MAX, SNAP_DISTANCE_MAX};
-use crate::ui::theme;
+use crate::state::{Mode, RulerState, COLOR_RADIUS_MAX, SENSITIVITY_MAX, SNAP_DISTANCE_MAX};
+use crate::ui::{overlay, theme};
 
 const BUTTON_CORNER: u8 = 4;
 const BORDER: Color32 = Color32::from_rgba_premultiplied(133, 143, 156, 128);
@@ -72,9 +72,9 @@ fn session_badge(ui: &mut Ui, state: &mut RulerState) {
     }
 }
 
-fn small_button(label: &str) -> egui::Button<'static> {
+fn small_button(label: &'static str) -> egui::Button<'static> {
     egui::Button::new(
-        egui::RichText::new(label.to_string())
+        egui::RichText::new(label)
             .color(Color32::WHITE)
             .size(theme::VALUE_SIZE),
     )
@@ -87,71 +87,58 @@ fn small_button(label: &str) -> egui::Button<'static> {
 /// Only one is shown at a time: the wheel drives whichever it is, so having a
 /// single visible dial keeps that mapping obvious.
 fn active_slider(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
-    match state.mode {
+    // The dial the mode owns: its label, starting value, range, and whether its
+    // read-out also reports the edge count the threshold produced.
+    let (title, start, max, show_edges) = match state.mode {
         Mode::RectDrag | Mode::ShrinkToFit => {
-            let mut value = state.snap_distance;
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Snap distance")
-                        .color(Color32::WHITE)
-                        .size(theme::TITLE_SIZE),
-                );
-                ui.add(
-                    egui::Slider::new(&mut value, 0.0..=SNAP_DISTANCE_MAX)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                ui.label(
-                    egui::RichText::new(format!("{} px", value.round()))
-                        .color(Color32::WHITE)
-                        .size(theme::VALUE_SIZE),
-                );
-            });
-            state.set_snap_distance(value);
+            ("Snap distance", state.snap_distance, SNAP_DISTANCE_MAX, false)
         }
-        Mode::ColorPicker => {
-            let mut value = state.color_radius;
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Average")
-                        .color(Color32::WHITE)
-                        .size(theme::TITLE_SIZE),
-                );
-                ui.add(
-                    egui::Slider::new(&mut value, 0.0..=COLOR_RADIUS_MAX)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                ui.label(
-                    egui::RichText::new(format!("{} px", value.round()))
-                        .color(Color32::WHITE)
-                        .size(theme::VALUE_SIZE),
-                );
-            });
-            state.set_color_radius(value);
+        Mode::ColorPicker => ("Average", state.color_radius, COLOR_RADIUS_MAX, false),
+        _ => ("Sensitivity", state.sensitivity, SENSITIVITY_MAX, true),
+    };
+
+    let value = slider_row(ui, title, start, max, |value| {
+        if show_edges {
+            format!("{}  ·  {edge_count} edges", value.round())
+        } else {
+            format!("{} px", value.round())
         }
-        _ => {
-            let mut value = state.sensitivity;
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("Sensitivity")
-                        .color(Color32::WHITE)
-                        .size(theme::TITLE_SIZE),
-                );
-                ui.add(
-                    egui::Slider::new(&mut value, 0.0..=100.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                ui.label(
-                    egui::RichText::new(format!("{}  ·  {edge_count} edges", value.round()))
-                        .color(Color32::WHITE)
-                        .size(theme::VALUE_SIZE),
-                );
-            });
-            state.set_sensitivity(value);
-        }
+    });
+
+    match state.mode {
+        Mode::RectDrag | Mode::ShrinkToFit => state.set_snap_distance(value),
+        Mode::ColorPicker => state.set_color_radius(value),
+        _ => state.set_sensitivity(value),
     }
+}
+
+/// One labelled slider row, returning the value the user left it at.
+fn slider_row(
+    ui: &mut Ui,
+    title: &str,
+    value: f32,
+    max: f32,
+    readout: impl FnOnce(f32) -> String,
+) -> f32 {
+    let mut value = value;
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(title)
+                .color(Color32::WHITE)
+                .size(theme::TITLE_SIZE),
+        );
+        ui.add(
+            egui::Slider::new(&mut value, 0.0..=max)
+                .show_value(false)
+                .trailing_fill(true),
+        );
+        ui.label(
+            egui::RichText::new(readout(value))
+                .color(Color32::WHITE)
+                .size(theme::VALUE_SIZE),
+        );
+    });
+    value
 }
 
 /// One mode button, drawing its icon with the painter rather than shipping assets.
@@ -341,7 +328,7 @@ pub fn message_bubble(ui: &Ui, canvas: Vec2, text: &str) {
     let painter = ui.painter();
     let font = FontId::proportional(theme::VALUE_SIZE);
     let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
-    let size = galley.size() + Vec2::new(theme::LABEL_H_PADDING, theme::LABEL_V_PADDING);
+    let size = overlay::chip_size(galley.size());
     let rect = Rect::from_center_size(Pos2::new(canvas.x / 2.0, 64.0), size);
 
     painter.rect_filled(rect, theme::corner_radius(), theme::panel_fill());

@@ -18,16 +18,19 @@ const FEEDBACK_DURATION: Duration = Duration::from_millis(1200);
 pub const HELP_AUTO_HIDE: Duration = Duration::from_millis(2000);
 /// Fade duration for the help overlay.
 pub const HELP_FADE: Duration = Duration::from_millis(220);
+/// How long the edge map is flashed after a sensitivity change.
+pub const EDGE_PREVIEW: Duration = Duration::from_millis(1000);
 
-/// Distance sliders and wheel adjustment bounds.
+/// Slider and wheel adjustment bounds.
 pub const SNAP_DISTANCE_MAX: f32 = 30.0;
 pub const COLOR_RADIUS_MAX: f32 = 24.0;
+pub const SENSITIVITY_MAX: f32 = 100.0;
 /// Default edge-snap radius in logical pixels.
 pub const DEFAULT_SNAP_DISTANCE: f32 = 10.0;
 
-/// Below this delta the point-to-point summary omits the per-axis breakdown,
-/// because a near-horizontal or near-vertical line does not need one.
-const DELTA_BREAKDOWN_THRESHOLD: f32 = 8.0;
+/// Below this delta a line counts as near-horizontal or near-vertical, and both
+/// the distance summary and the distance overlay drop their per-axis breakdown.
+pub const DELTA_BREAKDOWN_THRESHOLD: f32 = 8.0;
 
 /// The six measurement modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,11 +61,11 @@ impl Mode {
 
     /// Zero-based index, matching the `1`..`6` number-key shortcuts.
     pub fn index(self) -> usize {
-        Mode::ALL.iter().position(|m| *m == self).unwrap_or(0)
+        self as usize
     }
 
-    /// Inverse of [`Mode::index`]. Used by tests.
-    #[allow(dead_code)]
+    /// Inverse of [`Mode::index`], and the only place a number key is turned
+    /// into a mode.
     pub fn from_index(index: usize) -> Option<Mode> {
         Mode::ALL.get(index).copied()
     }
@@ -159,7 +162,7 @@ impl Annotation {
             } => format_size(east - west, south - north),
             AnnotationKind::Rect { width, height } => format_size(*width, *height),
             AnnotationKind::Color { sample, .. } => {
-                format!("{} {} {}", sample.hex(), sample.rgb(), sample.hsl())
+                sample.summary()
             }
             AnnotationKind::Distance { to_x, to_y } => {
                 format_distance_summary(self.at.x, self.at.y, *to_x, *to_y)
@@ -245,6 +248,40 @@ pub enum Command {
     Recompute,
 }
 
+/// A value that stops being reported once its deadline passes.
+///
+/// Both the confirm-before-discard prompt and the transient feedback message
+/// are "show this until it times out", so they share one implementation rather
+/// than each hand-rolling the same expiry check.
+struct Expiring<T>(Option<(T, Instant)>);
+
+impl<T> Expiring<T> {
+    fn new() -> Self {
+        Self(None)
+    }
+
+    fn set(&mut self, value: T, lifetime: Duration) {
+        self.0 = Some((value, Instant::now() + lifetime));
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+
+    /// The value, if one is set and unexpired. Drops it once it has expired.
+    fn get(&mut self) -> Option<&T> {
+        if matches!(&self.0, Some((_, expiry)) if Instant::now() >= *expiry) {
+            self.0 = None;
+        }
+        self.0.as_ref().map(|(value, _)| value)
+    }
+
+    /// The value regardless of expiry, for matching a repeated request.
+    fn peek(&self) -> Option<&T> {
+        self.0.as_ref().map(|(value, _)| value)
+    }
+}
+
 /// In-progress rectangle drag.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DragState {
@@ -295,8 +332,8 @@ pub struct RulerState {
     /// shortcut overlay are visible immediately, before the mouse has moved and
     /// told anyone where it is.
     pub active_monitor: usize,
-    /// Cursor after edge snapping, and whether it actually moved.
-    pub snapped: Option<(Point, bool)>,
+    /// Cursor pulled onto a nearby edge, when one was in range.
+    pub snapped: Option<Point>,
 
     pub drag: DragState,
     /// Container under the cursor, in the container mode.
@@ -314,8 +351,8 @@ pub struct RulerState {
     /// When the start-up help overlay should begin fading.
     pub help_auto_hide_at: Option<Instant>,
 
-    pending_destructive: Option<(Destructive, Instant)>,
-    feedback: Option<(String, Instant)>,
+    pending_destructive: Expiring<Destructive>,
+    feedback: Expiring<String>,
 
     /// Set when the debug edge overlay should be drawn.
     pub debug_edges: bool,
@@ -346,8 +383,8 @@ impl RulerState {
             export_drag: DragState::default(),
             help_visible: true,
             help_auto_hide_at: Some(Instant::now() + HELP_AUTO_HIDE),
-            pending_destructive: None,
-            feedback: None,
+            pending_destructive: Expiring::new(),
+            feedback: Expiring::new(),
             debug_edges,
             edge_preview_until: None,
             commands: Vec::new(),
@@ -407,7 +444,7 @@ impl RulerState {
             Mode::ColorPicker => self
                 .sample
                 .as_ref()
-                .map(|(_, s)| format!("{} {} {}", s.hex(), s.rgb(), s.hsl()))
+                .map(|(_, s)| s.summary())
                 .unwrap_or_default(),
             Mode::Distance => match (self.distance_anchor, self.pointer) {
                 (Some(a), Some(b)) => format_distance_summary(a.x, a.y, b.x, b.y),
@@ -524,13 +561,13 @@ impl RulerState {
 
         // A second press of the *same* action within the window confirms it;
         // a different action re-arms rather than firing.
-        if self.pending_destructive.map(|(a, _)| a) == Some(action) {
+        if self.pending_destructive.peek() == Some(&action) {
             self.clear_pending_destructive();
             self.perform_destructive(action);
             return;
         }
 
-        self.pending_destructive = Some((action, Instant::now() + CONFIRM_WINDOW));
+        self.pending_destructive.set(action, CONFIRM_WINDOW);
     }
 
     fn perform_destructive(&mut self, action: Destructive) {
@@ -548,35 +585,21 @@ impl RulerState {
     }
 
     pub fn clear_pending_destructive(&mut self) {
-        self.pending_destructive = None;
+        self.pending_destructive.clear();
     }
 
     /// The confirmation prompt to display, if one is armed and unexpired.
     pub fn destructive_prompt(&mut self) -> Option<&'static str> {
-        match self.pending_destructive {
-            Some((action, expiry)) if Instant::now() < expiry => Some(action.prompt()),
-            Some(_) => {
-                self.pending_destructive = None;
-                None
-            }
-            None => None,
-        }
+        self.pending_destructive.get().map(|action| action.prompt())
     }
 
     pub fn show_feedback(&mut self, message: &str) {
-        self.feedback = Some((message.to_string(), Instant::now() + FEEDBACK_DURATION));
+        self.feedback.set(message.to_string(), FEEDBACK_DURATION);
     }
 
     /// The transient feedback message to display, if unexpired.
     pub fn feedback_message(&mut self) -> Option<String> {
-        match &self.feedback {
-            Some((message, expiry)) if Instant::now() < *expiry => Some(message.clone()),
-            Some(_) => {
-                self.feedback = None;
-                None
-            }
-            None => None,
-        }
+        self.feedback.get().cloned()
     }
 
     // -------------------------------------------------------------- export
@@ -618,12 +641,17 @@ impl RulerState {
     // ------------------------------------------------------------ controls
 
     /// Sets sensitivity and schedules a re-analysis when it actually changed.
+    ///
+    /// Also arms the edge-map preview: this is the one place the threshold
+    /// moves, so it is the one place that decides the flash should happen,
+    /// whether the change came from the slider or the wheel.
     pub fn set_sensitivity(&mut self, value: f32) {
-        let clamped = value.clamp(0.0, 100.0);
+        let clamped = value.clamp(0.0, SENSITIVITY_MAX);
         if (clamped - self.sensitivity).abs() < 0.01 {
             return;
         }
         self.sensitivity = clamped;
+        self.edge_preview_until = Some(Instant::now() + EDGE_PREVIEW);
         self.push(Command::Recompute);
     }
 

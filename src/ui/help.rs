@@ -9,41 +9,37 @@ use crate::ui::theme;
 ///
 /// Context-sensitive on purpose: showing the drag hints while in crosshair
 /// mode, or the quick-copy hint during a session, taught the wrong thing.
-pub fn shortcut_lines(state: &RulerState) -> Vec<String> {
-    let mut lines = vec!["Keys 1-6 — switch measurement mode".to_string()];
+pub fn shortcut_lines(state: &RulerState) -> Vec<&'static str> {
+    let mut lines = vec!["Keys 1-6 — switch measurement mode"];
 
     lines.push(if state.session {
-        "Ctrl+C — copy all annotations as Markdown".to_string()
+        "Ctrl+C — copy all annotations as Markdown"
     } else {
-        "Ctrl+C — copy measurement, then quit".to_string()
+        "Ctrl+C — copy measurement, then quit"
     });
 
     lines.push(match (state.mode, state.session) {
-        (Mode::Distance, true) => {
-            "Click — place point A, then point B (persistent annotation)".to_string()
-        }
-        (Mode::Distance, false) => {
-            "Click — place point A, then point B to copy, then quit".to_string()
-        }
-        (mode, false) if mode.is_rect_selection() => "Drag — create selection".to_string(),
-        (_, true) => "Click — place annotation (persistent)".to_string(),
-        (_, false) => "Click — copy measurement, then quit".to_string(),
+        (Mode::Distance, true) => "Click — place point A, then point B (persistent annotation)",
+        (Mode::Distance, false) => "Click — place point A, then point B to copy, then quit",
+        (mode, false) if mode.is_rect_selection() => "Drag — create selection",
+        (_, true) => "Click — place annotation (persistent)",
+        (_, false) => "Click — copy measurement, then quit",
     });
 
     if !state.session && state.mode.is_rect_selection() {
-        lines.push("Enter — copy current selection, then quit".to_string());
+        lines.push("Enter — copy current selection, then quit");
     }
 
     if state.session {
-        lines.push("Ctrl+Z / Ctrl+Shift+Z — undo / redo annotation".to_string());
-        lines.push("Ctrl+Shift+C — drag a region to copy it with annotations".to_string());
-        lines.push("Tab or Esc — leave session mode".to_string());
+        lines.push("Ctrl+Z / Ctrl+Shift+Z — undo / redo annotation");
+        lines.push("Ctrl+Shift+C — drag a region to copy it with annotations");
+        lines.push("Tab or Esc — leave session mode");
     } else {
-        lines.push("Tab — enter session mode (persistent annotations)".to_string());
+        lines.push("Tab — enter session mode (persistent annotations)");
     }
 
-    lines.push("Wheel — adjust the active mode's control".to_string());
-    lines.push("? or H — toggle this overlay    ·    Q or Esc — quit".to_string());
+    lines.push("Wheel — adjust the active mode's control");
+    lines.push("? or H — toggle this overlay    ·    Q or Esc — quit");
 
     lines
 }

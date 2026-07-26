@@ -31,6 +31,16 @@ impl Sample {
         format!("hsl({}, {}%, {}%)", self.h, self.s, self.l)
     }
 
+    /// All three notations, in the order the readout bubble stacks them.
+    pub fn notations(&self) -> [String; 3] {
+        [self.hex(), self.rgb(), self.hsl()]
+    }
+
+    /// The three notations on one line, as copied to the clipboard.
+    pub fn summary(&self) -> String {
+        self.notations().join(" ")
+    }
+
     /// Builds a sample from RGB, deriving the HSL representation.
     pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
         let (h, s, l) = rgb_to_hsl(r, g, b);

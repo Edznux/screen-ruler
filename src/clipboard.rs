@@ -42,68 +42,51 @@ pub fn copy_image(image: &Rgba8) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// One clipboard helper: the program to run and the arguments it needs.
+#[cfg(target_os = "linux")]
+type Helper = (&'static str, &'static [&'static str]);
+
+/// Text helpers, X11 first. `wl-copy` is listed last so a Wayland session can
+/// promote it with a single rotation.
+#[cfg(target_os = "linux")]
+const TEXT_HELPERS: [Helper; 3] = [
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+    ("wl-copy", &[]),
+];
+
+/// Helpers for `image/png`, in the same order.
+#[cfg(target_os = "linux")]
+const IMAGE_HELPERS: [Helper; 2] = [
+    ("xclip", &["-selection", "clipboard", "-t", "image/png"]),
+    ("wl-copy", &["--type", "image/png"]),
+];
+
 /// Copies text with whichever Linux clipboard helper is installed.
 ///
 /// Returns `None` when no helper is available, so the caller can fall back.
 #[cfg(target_os = "linux")]
 fn linux_copy_text(text: &str) -> Option<Result<(), String>> {
-    for (program, args) in text_helpers() {
-        if let Some(result) = pipe_to(program, args, text.as_bytes()) {
-            return Some(result);
-        }
-    }
-    None
+    try_helpers(&TEXT_HELPERS, text.as_bytes())
 }
 
 /// Copies a PNG with whichever Linux clipboard helper is installed.
 #[cfg(target_os = "linux")]
 fn linux_copy_image(image: &Rgba8) -> Option<Result<(), String>> {
-    let png = crate::png::encode(image);
-    for (program, args) in image_helpers() {
-        if let Some(result) = pipe_to(program, args, &png) {
-            return Some(result);
-        }
-    }
-    None
+    try_helpers(&IMAGE_HELPERS, &crate::png::encode(image))
 }
 
-/// Clipboard helpers for text, most session-appropriate first.
+/// Feeds `payload` to the first helper that is installed, preferring the one
+/// that matches the session: on Wayland `wl-copy` moves to the front.
 #[cfg(target_os = "linux")]
-fn text_helpers() -> Vec<(&'static str, Vec<&'static str>)> {
-    if is_wayland() {
-        vec![
-            ("wl-copy", vec![]),
-            ("xclip", vec!["-selection", "clipboard"]),
-            ("xsel", vec!["--clipboard", "--input"]),
-        ]
-    } else {
-        vec![
-            ("xclip", vec!["-selection", "clipboard"]),
-            ("xsel", vec!["--clipboard", "--input"]),
-            ("wl-copy", vec![]),
-        ]
+fn try_helpers(helpers: &[Helper], payload: &[u8]) -> Option<Result<(), String>> {
+    let mut helpers = helpers.to_vec();
+    if crate::capture::is_wayland_session() {
+        helpers.rotate_right(1);
     }
-}
-
-/// Clipboard helpers for `image/png`.
-#[cfg(target_os = "linux")]
-fn image_helpers() -> Vec<(&'static str, Vec<&'static str>)> {
-    if is_wayland() {
-        vec![
-            ("wl-copy", vec!["--type", "image/png"]),
-            ("xclip", vec!["-selection", "clipboard", "-t", "image/png"]),
-        ]
-    } else {
-        vec![
-            ("xclip", vec!["-selection", "clipboard", "-t", "image/png"]),
-            ("wl-copy", vec!["--type", "image/png"]),
-        ]
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn is_wayland() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
+    helpers
+        .into_iter()
+        .find_map(|(program, args)| pipe_to(program, args, payload))
 }
 
 /// Feeds `payload` to a helper on stdin.
@@ -112,13 +95,9 @@ fn is_wayland() -> bool {
 /// it exists but failed, so a missing helper falls through to the next one
 /// while a real failure is reported.
 #[cfg(target_os = "linux")]
-fn pipe_to(
-    program: &str,
-    args: Vec<&str>,
-    payload: &[u8],
-) -> Option<Result<(), String>> {
+fn pipe_to(program: &str, args: &[&str], payload: &[u8]) -> Option<Result<(), String>> {
     let child = Command::new(program)
-        .args(&args)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

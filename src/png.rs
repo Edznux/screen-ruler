@@ -73,10 +73,12 @@ fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(kind);
     out.extend_from_slice(data);
 
-    let mut crc_input = Vec::with_capacity(4 + data.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+    // The CRC covers the type and the data, which are already contiguous at the
+    // end of `out` — checksum them in place rather than copying the whole
+    // payload into a second buffer just to hash it.
+    let checksummed = out.len() - kind.len() - data.len();
+    let crc = crc32(&out[checksummed..]);
+    out.extend_from_slice(&crc.to_be_bytes());
 }
 
 fn crc32(data: &[u8]) -> u32 {

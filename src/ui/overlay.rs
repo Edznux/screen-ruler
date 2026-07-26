@@ -8,15 +8,15 @@
 use egui::epaint::text::FontsView;
 use egui::{Color32, FontId, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2};
 
-use crate::state::{format_distance, format_size, Annotation, AnnotationKind};
+use crate::state::{
+    format_distance, format_size, Annotation, AnnotationKind, DELTA_BREAKDOWN_THRESHOLD,
+};
 use crate::ui::theme;
 
 /// Gap kept between a floating panel and the screen edge.
 const PANEL_MARGIN: f32 = 2.0;
 /// Length of the end caps on crosshair rays.
 const TICK_HALF_LENGTH: f32 = 5.0;
-/// Below this delta the distance overlay omits its dashed right-angle triangle.
-const TRIANGLE_MIN_DELTA: f32 = 8.0;
 
 /// Places a floating panel near an anchor, flipping it to the other side when
 /// it would overflow the monitor.
@@ -49,6 +49,23 @@ pub fn floating_panel_position(
     Pos2::new(x.clamp(margin, max_x), y.clamp(margin, max_y))
 }
 
+/// Size of the chip that wraps text of `content` size, including its padding.
+pub fn chip_size(content: Vec2) -> Vec2 {
+    content + Vec2::new(theme::LABEL_H_PADDING, theme::LABEL_V_PADDING)
+}
+
+/// The shadow-and-fill backdrop every floating chip sits on.
+fn chip_backdrop(rect: Rect) -> [Shape; 2] {
+    [
+        Shape::rect_filled(
+            rect.translate(Vec2::splat(theme::LABEL_SHADOW_OFFSET)),
+            theme::corner_radius(),
+            theme::PANEL_SHADOW,
+        ),
+        Shape::rect_filled(rect, theme::corner_radius(), theme::panel_fill()),
+    ]
+}
+
 /// The dark rounded measurement chip, with its drop shadow.
 pub fn measurement_label(
     fonts: &mut FontsView<'_>,
@@ -63,23 +80,17 @@ pub fn measurement_label(
 
     let font = FontId::monospace(theme::LABEL_TEXT_SIZE);
     let galley = fonts.layout_no_wrap(text.to_string(), font, theme::TEXT);
-    let size = galley.size() + Vec2::new(theme::LABEL_H_PADDING, theme::LABEL_V_PADDING);
+    let size = chip_size(galley.size());
     let position = floating_panel_position(anchor, size, offset, canvas, PANEL_MARGIN);
     let rect = Rect::from_min_size(position, size);
 
-    vec![
-        Shape::rect_filled(
-            rect.translate(Vec2::splat(theme::LABEL_SHADOW_OFFSET)),
-            theme::corner_radius(),
-            theme::PANEL_SHADOW,
-        ),
-        Shape::rect_filled(rect, theme::corner_radius(), theme::panel_fill()),
-        Shape::galley(
-            rect.center() - galley.size() / 2.0,
-            galley,
-            theme::TEXT,
-        ),
-    ]
+    let mut shapes = chip_backdrop(rect).to_vec();
+    shapes.push(Shape::galley(
+        rect.center() - galley.size() / 2.0,
+        galley,
+        theme::TEXT,
+    ));
+    shapes
 }
 
 /// Default offset of a measurement chip from its anchor.
@@ -198,23 +209,13 @@ pub fn color_bubble(
     let row_spacing = 10.0;
     let row_width = swatch_size + row_spacing + text_width;
     let row_height = text_height.max(swatch_size);
-    let size = Vec2::new(
-        row_width + theme::LABEL_H_PADDING,
-        row_height + theme::LABEL_V_PADDING,
-    );
+    let size = chip_size(Vec2::new(row_width, row_height));
 
     let offset = Vec2::new(theme::BASE_MARGIN + 8.0, theme::LABEL_OFFSET_Y + 6.0);
     let position = floating_panel_position(anchor, size, offset, canvas, PANEL_MARGIN);
     let rect = Rect::from_min_size(position, size);
 
-    let mut shapes = vec![
-        Shape::rect_filled(
-            rect.translate(Vec2::splat(theme::LABEL_SHADOW_OFFSET)),
-            theme::corner_radius(),
-            theme::PANEL_SHADOW,
-        ),
-        Shape::rect_filled(rect, theme::corner_radius(), theme::panel_fill()),
-    ];
+    let mut shapes = chip_backdrop(rect).to_vec();
 
     let row_left = rect.left() + (size.x - row_width) / 2.0;
     let row_top = rect.top() + (size.y - row_height) / 2.0;
@@ -258,7 +259,7 @@ pub fn distance(
     let delta = to - from;
 
     // The dx/dy breakdown only helps when the line is meaningfully diagonal.
-    if delta.x.abs().min(delta.y.abs()) > TRIANGLE_MIN_DELTA {
+    if delta.x.abs().min(delta.y.abs()) > DELTA_BREAKDOWN_THRESHOLD {
         let corner = Pos2::new(to.x, from.y);
         let dashed = Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.7));
         shapes.extend(Shape::dashed_line(&[from, corner], dashed, 4.0, 4.0));
@@ -335,7 +336,7 @@ pub fn annotation(fonts: &mut FontsView<'_>, annotation: &Annotation, canvas: Ve
             shapes.extend(color_bubble(
                 fonts,
                 at,
-                [sample.hex(), sample.rgb(), sample.hsl()],
+                sample.notations(),
                 Color32::from_rgb(sample.r, sample.g, sample.b),
                 canvas,
             ));
@@ -389,34 +390,18 @@ pub fn session_border_opacity(cursor: Option<Pos2>, canvas: Vec2) -> f32 {
 pub fn session_border(canvas: Vec2, opacity: f32) -> Vec<Shape> {
     let thickness = theme::SESSION_BORDER_THICKNESS;
     let color = theme::ACCENT.gamma_multiply(opacity);
-    vec![
-        Shape::rect_filled(
-            Rect::from_min_size(Pos2::ZERO, Vec2::new(canvas.x, thickness)),
-            0,
-            color,
-        ),
-        Shape::rect_filled(
-            Rect::from_min_size(
-                Pos2::new(0.0, canvas.y - thickness),
-                Vec2::new(canvas.x, thickness),
-            ),
-            0,
-            color,
-        ),
-        Shape::rect_filled(
-            Rect::from_min_size(Pos2::ZERO, Vec2::new(thickness, canvas.y)),
-            0,
-            color,
-        ),
-        Shape::rect_filled(
-            Rect::from_min_size(
-                Pos2::new(canvas.x - thickness, 0.0),
-                Vec2::new(thickness, canvas.y),
-            ),
-            0,
-            color,
-        ),
+    let horizontal = Vec2::new(canvas.x, thickness);
+    let vertical = Vec2::new(thickness, canvas.y);
+
+    [
+        (Pos2::ZERO, horizontal),
+        (Pos2::new(0.0, canvas.y - thickness), horizontal),
+        (Pos2::ZERO, vertical),
+        (Pos2::new(canvas.x - thickness, 0.0), vertical),
     ]
+    .into_iter()
+    .map(|(corner, size)| Shape::rect_filled(Rect::from_min_size(corner, size), 0, color))
+    .collect()
 }
 
 /// Marker drawn at a snapped pointer position, so a snap is visible.

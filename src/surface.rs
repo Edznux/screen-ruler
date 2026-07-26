@@ -51,17 +51,17 @@ impl Surface {
     }
 
     /// Snaps a logical point onto nearby edges, returning logical coordinates.
-    pub fn snap_logical(&self, x: f32, y: f32, radius_logical: f32) -> (f32, f32, bool) {
+    ///
+    /// `None` when no edge was within range, so callers cannot mistake an
+    /// unmoved point for a snapped one.
+    pub fn snap_logical(&self, x: f32, y: f32, radius_logical: f32) -> Option<(f32, f32)> {
         if radius_logical <= 0.0 {
-            return (x, y, false);
+            return None;
         }
         let (px, py) = self.logical_to_pixel(x, y);
         let radius = self.geometry.logical_to_image(radius_logical, 0.0).0.ceil() as usize;
-        let snap = measure::snap_to_edge(&self.edges, px, py, radius, self.snap_band());
-        let (lx, ly) = self
-            .geometry
-            .image_to_logical(snap.x as f32, snap.y as f32);
-        (lx, ly, snap.snapped)
+        let (sx, sy) = measure::snap_to_edge(&self.edges, px, py, radius, self.snap_band())?;
+        Some(self.geometry.image_to_logical(sx as f32, sy as f32))
     }
 
     /// Tightens a logical rectangle onto the content it encloses.
@@ -123,6 +123,19 @@ pub struct LogicalRect {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl LogicalRect {
+    /// Attaches the rectangle to the monitor it was measured on.
+    pub fn on_monitor(self, monitor: usize) -> crate::state::Rect {
+        crate::state::Rect {
+            monitor,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+    }
 }
 
 /// Ray distances converted into logical pixels, which is what the UI reports.
@@ -189,11 +202,6 @@ impl Desktop {
         self.surfaces.get(index)
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.surfaces.len()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.surfaces.is_empty()
     }
@@ -236,7 +244,8 @@ impl Desktop {
         });
     }
 
-    /// Total edge pixels across all monitors, for the start-up diagnostic.
+    /// Total edge pixels across all monitors, shown beside the sensitivity
+    /// slider. Each map carries its own count, so this is a per-monitor add.
     pub fn edge_count(&self) -> usize {
         self.surfaces.iter().map(|s| s.edges.count()).sum()
     }
@@ -308,17 +317,16 @@ mod tests {
     fn snapping_returns_logical_coordinates() {
         let s = surface(2.0, 64, 48, 32);
         // The edge sits near image column 32, i.e. logical x == 16.
-        let (x, _y, snapped) = s.snap_logical(18.0, 12.0, 5.0);
-        assert!(snapped, "expected a snap onto the split edge");
+        let (x, _y) = s
+            .snap_logical(18.0, 12.0, 5.0)
+            .expect("expected a snap onto the split edge");
         assert!((x - 16.0).abs() <= 1.0, "snapped to logical x {x}");
     }
 
     #[test]
     fn snapping_with_a_zero_radius_is_disabled() {
         let s = surface(1.0, 64, 48, 32);
-        let (x, y, snapped) = s.snap_logical(18.0, 12.0, 0.0);
-        assert!(!snapped);
-        assert_eq!((x, y), (18.0, 12.0));
+        assert_eq!(s.snap_logical(18.0, 12.0, 0.0), None);
     }
 
     #[test]

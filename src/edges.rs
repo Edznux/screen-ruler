@@ -24,6 +24,9 @@ pub const DEFAULT_SENSITIVITY: f32 = 85.0;
 pub struct EdgeMap {
     width: usize,
     height: usize,
+    /// Edge pixels, counted once here because the map is immutable and the
+    /// controls panel reports the total on every frame.
+    count: usize,
     data: Vec<bool>,
 }
 
@@ -35,6 +38,7 @@ impl EdgeMap {
         Some(Self {
             width,
             height,
+            count: data.iter().filter(|v| **v).count(),
             data,
         })
     }
@@ -43,8 +47,22 @@ impl EdgeMap {
         Self {
             width,
             height,
+            count: 0,
             data: vec![false; width * height],
         }
+    }
+
+    /// Builds a map from ASCII art where `#` marks an edge pixel.
+    #[cfg(test)]
+    pub fn from_ascii(rows: &[&str]) -> Self {
+        let height = rows.len();
+        let width = rows.first().map_or(0, |row| row.len());
+        let mut data = Vec::with_capacity(width * height);
+        for row in rows {
+            assert_eq!(row.len(), width, "ragged test fixture");
+            data.extend(row.chars().map(|c| c == '#'));
+        }
+        Self::new(width, height, data).expect("valid map")
     }
 
     pub fn width(&self) -> usize {
@@ -72,9 +90,9 @@ impl EdgeMap {
         &self.data
     }
 
-    /// Number of edge pixels; used for the startup diagnostic line.
+    /// Number of edge pixels.
     pub fn count(&self) -> usize {
-        self.data.iter().filter(|v| **v).count()
+        self.count
     }
 
     /// True when any pixel in the inclusive column span of a single row is an edge.

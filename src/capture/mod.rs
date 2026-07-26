@@ -44,6 +44,14 @@ impl std::fmt::Display for CaptureError {
 
 impl std::error::Error for CaptureError {}
 
+/// True when a Wayland session is in use.
+///
+/// Decides which capture backend to try first and which clipboard helper to
+/// prefer, so it is defined once here rather than re-derived at each call site.
+pub fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
 /// A platform-specific hint shown when capture fails, so the user knows what to
 /// grant or install rather than just seeing an error.
 pub fn permission_hint() -> &'static str {
@@ -53,7 +61,7 @@ pub fn permission_hint() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "Check that the app is allowed to capture the screen and is not blocked by a \
          protected-content policy."
-    } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
+    } else if is_wayland_session() {
         "On Wayland, allow the screen-capture request from the desktop portal when prompted. \
          A portal implementation (xdg-desktop-portal plus a backend such as \
          xdg-desktop-portal-wlr, -gnome or -kde) must be running."
@@ -72,7 +80,7 @@ pub fn capture_all() -> Result<Vec<CapturedMonitor>, CaptureError> {
     let mut attempts: Vec<String> = Vec::new();
 
     #[cfg(target_os = "linux")]
-    if wlr::is_wayland_session() {
+    if is_wayland_session() {
         match wlr::capture_all() {
             Ok(monitors) if !monitors.is_empty() => return Ok(finish(monitors)),
             Ok(_) => attempts.push("wlr-screencopy: no monitors returned".to_string()),

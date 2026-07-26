@@ -245,13 +245,8 @@ fn capture_output(
 /// does not. Falls back to the integer scale when the mode is unknown.
 fn derive_scale(mode_width: i32, output_scale: i32, image_width: usize) -> f32 {
     let output_scale = output_scale.max(1);
-    if mode_width > 0 && image_width > 0 {
-        let logical_width = mode_width as f32 / output_scale as f32;
-        if logical_width > 0.0 {
-            return image_width as f32 / logical_width;
-        }
-    }
-    output_scale as f32
+    let logical_width = (mode_width.max(0) as f32) / output_scale as f32;
+    crate::geometry::scale_from_widths(image_width, logical_width).unwrap_or(output_scale as f32)
 }
 
 /// Creates a sized, unlinked file in a tmpfs to back the shm pool.
@@ -329,11 +324,6 @@ fn to_rgba8(raw: &[u8], spec: BufferSpec, y_invert: bool) -> Option<Rgba8> {
     }
 
     Rgba8::from_raw(width, height, out)
-}
-
-/// True when a Wayland session is in use, so this backend should be tried first.
-pub fn is_wayland_session() -> bool {
-    std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 impl Dispatch<WlRegistry, ()> for State {

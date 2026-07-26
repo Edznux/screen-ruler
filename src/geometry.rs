@@ -16,6 +16,20 @@
 //! correctly on both — which the previous single-stretched-overlay design could
 //! not do.
 
+/// Device pixels per logical pixel, from a captured bitmap's width and the
+/// logical width it covers.
+///
+/// This ratio is the authority on scale — it stays correct under fractional
+/// scaling, where the integer scale a compositor advertises does not — so both
+/// the capture backends and the window shell derive it here rather than each
+/// spelling out the division.
+///
+/// `None` when either width is unusable, leaving the fallback to the caller.
+pub fn scale_from_widths(image_width: usize, logical_width: f32) -> Option<f32> {
+    (image_width > 0 && logical_width > 0.0 && logical_width.is_finite())
+        .then(|| image_width as f32 / logical_width)
+}
+
 /// Where one monitor sits in the virtual desktop, and how dense its pixels are.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MonitorGeometry {
