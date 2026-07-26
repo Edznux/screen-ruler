@@ -118,24 +118,9 @@ impl App {
             .map_err(|e| format!("cannot create an OpenGL config: {e}"))?;
 
         let gl_display = gl_config.display();
-        let context_attributes = ContextAttributesBuilder::new()
-            // Ask for OpenGL ES too: it is what most Wayland stacks provide.
-            .with_context_api(ContextApi::OpenGl(None))
-            .build(None);
-        let fallback_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(None))
-            .build(None);
-
-        let not_current = unsafe {
-            gl_display
-                .create_context(&gl_config, &context_attributes)
-                .or_else(|_| gl_display.create_context(&gl_config, &fallback_attributes))
-        }
-        .map_err(|e| format!("cannot create an OpenGL context: {e}"))?;
 
         // One context, shared by every window: each is made current against its
         // own surface just before that window is painted.
-        let mut not_current = Some(not_current);
         let mut current_context: Option<PossiblyCurrentContext> = None;
         // Loading GL function pointers queries GL_VERSION, so it can only
         // happen once a context is actually current — that is, inside the loop
@@ -171,11 +156,26 @@ impl App {
 
             let context = match current_context.take() {
                 Some(context) => context,
-                None => not_current
-                    .take()
-                    .expect("the context is created exactly once")
-                    .make_current(&gl_surface)
-                    .map_err(|e| format!("cannot activate the GL context: {e}"))?,
+                None => {
+                    let context_attributes = ContextAttributesBuilder::new()
+                        // Ask for OpenGL ES too: it is what most Wayland stacks provide.
+                        .with_context_api(ContextApi::OpenGl(None))
+                        .build(Some(raw_handle));
+                    let fallback_attributes = ContextAttributesBuilder::new()
+                        .with_context_api(ContextApi::Gles(None))
+                        .build(Some(raw_handle));
+                    let not_current = unsafe {
+                        gl_display
+                            .create_context(&gl_config, &context_attributes)
+                            .or_else(|_| {
+                                gl_display.create_context(&gl_config, &fallback_attributes)
+                            })
+                    }
+                    .map_err(|e| format!("cannot create an OpenGL context: {e}"))?;
+                    not_current
+                        .make_current(&gl_surface)
+                        .map_err(|e| format!("cannot activate the GL context: {e}"))?
+                }
             };
             context
                 .make_current(&gl_surface)

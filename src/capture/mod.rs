@@ -5,8 +5,6 @@
 //! resolution and scale factor instead of being resampled into a single
 //! lowest-common-denominator image.
 
-use std::thread;
-
 use crate::geometry::MonitorGeometry;
 use crate::image::Rgba8;
 
@@ -117,20 +115,8 @@ fn capture_all_xcap() -> Result<Vec<CapturedMonitor>, CaptureError> {
         return Err(CaptureError::NoMonitors);
     }
 
-    let results: Vec<Result<CapturedMonitor, String>> = thread::scope(|scope| {
-        let handles: Vec<_> = monitors
-            .iter()
-            .map(|monitor| scope.spawn(move || capture_one(monitor)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .unwrap_or_else(|_| Err("capture thread panicked".to_string()))
-            })
-            .collect()
-    });
+    let results: Vec<Result<CapturedMonitor, String>> =
+        monitors.into_iter().map(capture_one).collect();
 
     let mut captured = Vec::new();
     let mut first_error = None;
@@ -155,7 +141,7 @@ fn capture_all_xcap() -> Result<Vec<CapturedMonitor>, CaptureError> {
 }
 
 /// Captures a single monitor and packages it with its reported geometry.
-fn capture_one(monitor: &xcap::Monitor) -> Result<CapturedMonitor, String> {
+fn capture_one(monitor: xcap::Monitor) -> Result<CapturedMonitor, String> {
     let name = monitor
         .name()
         .or_else(|_| monitor.friendly_name())
