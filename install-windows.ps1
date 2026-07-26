@@ -24,12 +24,20 @@ $ErrorActionPreference = 'Stop'
 
 $AppName = 'Screen Ruler'
 $AppId   = 'screen-ruler'
-$Binary  = Join-Path $PSScriptRoot 'dist' 'screen-ruler.exe'
 
-# --- Locate the built binary ------------------------------------------------
+# --- Locate the binary -------------------------------------------------------
+#
+# Accepts either a release binary downloaded next to this script, or one built
+# locally with `cargo build --release`.
 
-if (-not (Test-Path $Binary)) {
-    Write-Error "Binary not found at $Binary.`nBuild it first:  pyinstaller screen_ruler.spec" -ErrorAction Continue
+$Candidates = @(
+    (Join-Path $PSScriptRoot 'screen-ruler.exe'),
+    (Join-Path $PSScriptRoot 'target\release\screen-ruler.exe')
+)
+$Binary = $Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+if (-not $Binary) {
+    Write-Error "No screen-ruler.exe found.`nDownload a release binary next to this script, or build one with:`n  cargo build --release" -ErrorAction Continue
     exit 1
 }
 

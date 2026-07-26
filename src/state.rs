@@ -1,0 +1,1047 @@
+//! Interaction state and the rules that govern it.
+//!
+//! Deliberately free of any windowing or drawing types: the UI layer reads this
+//! and renders it, and side effects the shell must perform (quit, clipboard)
+//! leave through [`RulerState::take_commands`]. That keeps the behaviour that
+//! is easy to get wrong — mode switching, undo/redo, the confirm-before-discard
+//! flow — testable without a display.
+
+use std::time::{Duration, Instant};
+
+use crate::color::Sample;
+
+/// How long a destructive action stays armed awaiting confirmation.
+const CONFIRM_WINDOW: Duration = Duration::from_millis(1500);
+/// How long transient session feedback stays on screen.
+const FEEDBACK_DURATION: Duration = Duration::from_millis(1200);
+/// How long the help overlay lingers at start-up before fading.
+pub const HELP_AUTO_HIDE: Duration = Duration::from_millis(2000);
+/// Fade duration for the help overlay.
+pub const HELP_FADE: Duration = Duration::from_millis(220);
+
+/// Distance sliders and wheel adjustment bounds.
+pub const SNAP_DISTANCE_MAX: f32 = 30.0;
+pub const COLOR_RADIUS_MAX: f32 = 24.0;
+/// Default edge-snap radius in logical pixels.
+pub const DEFAULT_SNAP_DISTANCE: f32 = 10.0;
+
+/// Below this delta the point-to-point summary omits the per-axis breakdown,
+/// because a near-horizontal or near-vertical line does not need one.
+const DELTA_BREAKDOWN_THRESHOLD: f32 = 8.0;
+
+/// The six measurement modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Cast rays outward from the cursor to the nearest edges.
+    Crosshair,
+    /// Drag a freehand rectangle.
+    RectDrag,
+    /// Detect the enclosing container under the cursor.
+    Container,
+    /// Drag a rectangle, then tighten it onto the content it encloses.
+    ShrinkToFit,
+    /// Sample a colour under the cursor.
+    ColorPicker,
+    /// Measure between two placed points.
+    Distance,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 6] = [
+        Mode::Crosshair,
+        Mode::RectDrag,
+        Mode::Container,
+        Mode::ShrinkToFit,
+        Mode::ColorPicker,
+        Mode::Distance,
+    ];
+
+    /// Zero-based index, matching the `1`..`6` number-key shortcuts.
+    pub fn index(self) -> usize {
+        Mode::ALL.iter().position(|m| *m == self).unwrap_or(0)
+    }
+
+    /// Inverse of [`Mode::index`]. Used by tests.
+    #[allow(dead_code)]
+    pub fn from_index(index: usize) -> Option<Mode> {
+        Mode::ALL.get(index).copied()
+    }
+
+    /// Tooltip shown on the mode button.
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Crosshair => "Crosshair",
+            Mode::RectDrag => "Drag rectangle",
+            Mode::Container => "Container detection",
+            Mode::ShrinkToFit => "Shrink-to-fit",
+            Mode::ColorPicker => "Color picker",
+            Mode::Distance => "Point distance",
+        }
+    }
+
+    /// Heading used for this mode in the Markdown export.
+    fn export_title(self) -> &'static str {
+        match self {
+            Mode::Crosshair => "Crosshair",
+            Mode::RectDrag | Mode::Container | Mode::ShrinkToFit => "Rectangle",
+            Mode::ColorPicker => "Color",
+            Mode::Distance => "Distance",
+        }
+    }
+
+    /// True for the two modes driven by dragging a rectangle.
+    pub fn is_rect_selection(self) -> bool {
+        matches!(self, Mode::RectDrag | Mode::ShrinkToFit)
+    }
+}
+
+/// A point on a specific monitor, in that monitor's logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Point {
+    pub monitor: usize,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A rectangle on a specific monitor, in that monitor's logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub monitor: usize,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// What a placed annotation records.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AnnotationKind {
+    Crosshair {
+        /// Ray endpoints in logical pixels, monitor-local.
+        north: f32,
+        south: f32,
+        west: f32,
+        east: f32,
+    },
+    Rect {
+        width: f32,
+        height: f32,
+    },
+    Color {
+        sample: Sample,
+        radius: f32,
+    },
+    Distance {
+        to_x: f32,
+        to_y: f32,
+    },
+}
+
+/// One persistent annotation placed in session mode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Annotation {
+    /// Anchor point: the cursor for crosshair/colour, the top-left for a
+    /// rectangle, point A for a distance.
+    pub at: Point,
+    pub mode: Mode,
+    pub kind: AnnotationKind,
+}
+
+impl Annotation {
+    /// The measurement string shown next to the annotation and copied out.
+    pub fn measurement_text(&self) -> String {
+        match &self.kind {
+            AnnotationKind::Crosshair {
+                north,
+                south,
+                west,
+                east,
+            } => format_size(east - west, south - north),
+            AnnotationKind::Rect { width, height } => format_size(*width, *height),
+            AnnotationKind::Color { sample, .. } => {
+                format!("{} {} {}", sample.hex(), sample.rgb(), sample.hsl())
+            }
+            AnnotationKind::Distance { to_x, to_y } => {
+                format_distance_summary(self.at.x, self.at.y, *to_x, *to_y)
+            }
+        }
+    }
+}
+
+/// Formats a width/height pair the way the measurement label shows it.
+pub fn format_size(width: f32, height: f32) -> String {
+    format!("{} \u{00D7} {} px", width.abs().round(), height.abs().round())
+}
+
+/// Formats a scalar pixel distance with at most one decimal place.
+pub fn format_distance(value: f32) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < f32::EPSILON {
+        format!("{} px", rounded.round())
+    } else {
+        format!("{rounded:.1} px")
+    }
+}
+
+/// Formats the full A-to-B summary, adding a per-axis breakdown only when the
+/// line is meaningfully diagonal.
+pub fn format_distance_summary(ax: f32, ay: f32, bx: f32, by: f32) -> String {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let distance = (dx * dx + dy * dy).sqrt();
+    let mut summary = format!(
+        "A({}, {}) \u{2192} B({}, {}) \u{2014} {}",
+        ax.round(),
+        ay.round(),
+        bx.round(),
+        by.round(),
+        format_distance(distance)
+    );
+    if dx.abs().round().min(dy.abs().round()) > DELTA_BREAKDOWN_THRESHOLD {
+        summary.push_str(&format!(
+            " (\u{0394}x={}, \u{0394}y={})",
+            dx.abs().round(),
+            dy.abs().round()
+        ));
+    }
+    summary
+}
+
+/// An action that discards work and therefore asks for confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destructive {
+    /// Leave session mode via Tab.
+    ToggleSession,
+    /// Leave session mode via the SESSION badge.
+    SessionButton,
+    /// Escape.
+    Escape,
+    /// Q.
+    Quit,
+}
+
+impl Destructive {
+    fn prompt(self) -> &'static str {
+        match self {
+            Destructive::ToggleSession => "Press Tab again to discard annotations",
+            Destructive::SessionButton => "Click SESSION again to discard annotations",
+            Destructive::Escape => "Press Esc again to discard annotations",
+            Destructive::Quit => "Press Q again to discard annotations",
+        }
+    }
+}
+
+/// A side effect for the shell to carry out.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    Quit,
+    /// Copy text, then quit. Used by the "measure and go" quick flow.
+    CopyTextAndQuit(String),
+    /// Copy text and stay open. Used by session-mode Markdown export.
+    CopyText(String),
+    /// Composite the given region of a monitor with its annotations and copy it.
+    CopyRegionImage(Rect),
+    /// Edge thresholds changed; re-analyse every monitor.
+    Recompute,
+}
+
+/// In-progress rectangle drag.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DragState {
+    pub active: bool,
+    pub has_selection: bool,
+    pub monitor: usize,
+    pub start: (f32, f32),
+    pub end: (f32, f32),
+}
+
+impl DragState {
+    /// The normalised selection, or `None` when nothing is selected.
+    pub fn rect(&self) -> Option<Rect> {
+        if !self.has_selection && !self.active {
+            return None;
+        }
+        Some(Rect {
+            monitor: self.monitor,
+            x: self.start.0.min(self.end.0),
+            y: self.start.1.min(self.end.1),
+            width: (self.end.0 - self.start.0).abs(),
+            height: (self.end.1 - self.start.1).abs(),
+        })
+    }
+
+    fn clear(&mut self) {
+        self.active = false;
+        self.has_selection = false;
+    }
+}
+
+/// The whole application's interaction state.
+pub struct RulerState {
+    pub mode: Mode,
+    pub sensitivity: f32,
+    pub snap_distance: f32,
+    pub color_radius: f32,
+
+    pub session: bool,
+    pub annotations: Vec<Annotation>,
+    redo_stack: Vec<Annotation>,
+
+    /// Cursor position, absent until the pointer first enters a window.
+    pub pointer: Option<Point>,
+    /// Monitor that owns the controls panel.
+    ///
+    /// Follows the cursor, but starts on the first monitor so the panel and the
+    /// shortcut overlay are visible immediately, before the mouse has moved and
+    /// told anyone where it is.
+    pub active_monitor: usize,
+    /// Cursor after edge snapping, and whether it actually moved.
+    pub snapped: Option<(Point, bool)>,
+
+    pub drag: DragState,
+    /// Container under the cursor, in the container mode.
+    pub container: Option<Rect>,
+    /// Colour under the cursor, in the eyedropper mode.
+    pub sample: Option<(Point, Sample)>,
+    /// First placed point, while awaiting the second.
+    pub distance_anchor: Option<Point>,
+
+    /// Composite-export selection, armed by Ctrl+Shift+C.
+    pub export_armed: bool,
+    pub export_drag: DragState,
+
+    pub help_visible: bool,
+    /// When the start-up help overlay should begin fading.
+    pub help_auto_hide_at: Option<Instant>,
+
+    pending_destructive: Option<(Destructive, Instant)>,
+    feedback: Option<(String, Instant)>,
+
+    /// Set when the debug edge overlay should be drawn.
+    pub debug_edges: bool,
+    /// Transient edge-map preview shown after a sensitivity change.
+    pub edge_preview_until: Option<Instant>,
+
+    commands: Vec<Command>,
+}
+
+impl RulerState {
+    pub fn new(sensitivity: f32, debug_edges: bool) -> Self {
+        Self {
+            mode: Mode::Crosshair,
+            sensitivity,
+            snap_distance: DEFAULT_SNAP_DISTANCE,
+            color_radius: 0.0,
+            session: false,
+            annotations: Vec::new(),
+            redo_stack: Vec::new(),
+            pointer: None,
+            active_monitor: 0,
+            snapped: None,
+            drag: DragState::default(),
+            container: None,
+            sample: None,
+            distance_anchor: None,
+            export_armed: false,
+            export_drag: DragState::default(),
+            help_visible: true,
+            help_auto_hide_at: Some(Instant::now() + HELP_AUTO_HIDE),
+            pending_destructive: None,
+            feedback: None,
+            debug_edges,
+            edge_preview_until: None,
+            commands: Vec::new(),
+        }
+    }
+
+    /// Drains queued side effects for the shell to perform.
+    pub fn take_commands(&mut self) -> Vec<Command> {
+        std::mem::take(&mut self.commands)
+    }
+
+    fn push(&mut self, command: Command) {
+        self.commands.push(command);
+    }
+
+    // ---------------------------------------------------------------- modes
+
+    /// Switches mode, discarding any selection that does not carry over.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.clear_pending_destructive();
+        self.cancel_export();
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+
+        if !mode.is_rect_selection() {
+            self.drag.clear();
+        }
+        if mode != Mode::Container {
+            self.container = None;
+        }
+        if mode != Mode::ColorPicker {
+            self.sample = None;
+        }
+        if mode != Mode::Distance {
+            self.distance_anchor = None;
+        }
+    }
+
+    // ------------------------------------------------------------ selection
+
+    /// The rectangle the current mode is measuring, if any.
+    pub fn active_rect(&self) -> Option<Rect> {
+        match self.mode {
+            Mode::RectDrag | Mode::ShrinkToFit => {
+                self.drag.has_selection.then(|| self.drag.rect()).flatten()
+            }
+            Mode::Container => self.container,
+            _ => None,
+        }
+    }
+
+    /// The measurement text for the current mode, or empty when nothing is measured.
+    pub fn measurement_text(&self, crosshair: Option<(f32, f32)>) -> String {
+        match self.mode {
+            Mode::ColorPicker => self
+                .sample
+                .as_ref()
+                .map(|(_, s)| format!("{} {} {}", s.hex(), s.rgb(), s.hsl()))
+                .unwrap_or_default(),
+            Mode::Distance => match (self.distance_anchor, self.pointer) {
+                (Some(a), Some(b)) => format_distance_summary(a.x, a.y, b.x, b.y),
+                _ => String::new(),
+            },
+            Mode::RectDrag | Mode::ShrinkToFit | Mode::Container => self
+                .active_rect()
+                .map(|r| format_size(r.width, r.height))
+                .unwrap_or_default(),
+            Mode::Crosshair => crosshair
+                .map(|(w, h)| format_size(w, h))
+                .unwrap_or_default(),
+        }
+    }
+
+    // --------------------------------------------------------- annotations
+
+    /// Records an annotation, clearing the redo stack.
+    pub fn add_annotation(&mut self, annotation: Annotation) {
+        self.annotations.push(annotation);
+        self.redo_stack.clear();
+    }
+
+    /// Undoes the last annotation. Returns false when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        match self.annotations.pop() {
+            Some(annotation) => {
+                self.redo_stack.push(annotation);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Redoes the last undone annotation.
+    pub fn redo(&mut self) -> bool {
+        match self.redo_stack.pop() {
+            Some(annotation) => {
+                self.annotations.push(annotation);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Renders every annotation as a Markdown list.
+    pub fn annotations_markdown(&self) -> String {
+        self.annotations
+            .iter()
+            .map(|annotation| {
+                let measurement = annotation.measurement_text();
+                match annotation.mode {
+                    // A distance already names both endpoints, so prefixing it
+                    // with a single anchor coordinate would be redundant.
+                    Mode::Distance => {
+                        format!("- {}: {}", annotation.mode.export_title(), measurement)
+                    }
+                    _ => format!(
+                        "- {} @ ({}, {}): {}",
+                        annotation.mode.export_title(),
+                        annotation.at.x.round(),
+                        annotation.at.y.round(),
+                        measurement
+                    ),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Copies all annotations as Markdown, keeping the session open.
+    pub fn copy_annotations(&mut self) {
+        let markdown = self.annotations_markdown();
+        if markdown.is_empty() {
+            self.show_feedback("No annotations to copy");
+            return;
+        }
+        self.push(Command::CopyText(markdown));
+        let count = self.annotations.len();
+        self.show_feedback(&format!(
+            "Copied {count} annotation{}",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+
+    // ------------------------------------------------------------- session
+
+    pub fn set_session(&mut self, enabled: bool) {
+        if self.session == enabled {
+            return;
+        }
+        self.session = enabled;
+        if !enabled {
+            self.annotations.clear();
+            self.redo_stack.clear();
+            self.cancel_export();
+        }
+        self.clear_pending_destructive();
+    }
+
+    /// True when leaving session mode would throw away placed annotations.
+    fn has_work_to_lose(&self) -> bool {
+        self.session && !self.annotations.is_empty()
+    }
+
+    /// Runs a destructive action, or arms it for confirmation when it would
+    /// discard annotations.
+    pub fn request_destructive(&mut self, action: Destructive) {
+        if !self.has_work_to_lose() {
+            self.clear_pending_destructive();
+            self.perform_destructive(action);
+            return;
+        }
+
+        // A second press of the *same* action within the window confirms it;
+        // a different action re-arms rather than firing.
+        if self.pending_destructive.map(|(a, _)| a) == Some(action) {
+            self.clear_pending_destructive();
+            self.perform_destructive(action);
+            return;
+        }
+
+        self.pending_destructive = Some((action, Instant::now() + CONFIRM_WINDOW));
+    }
+
+    fn perform_destructive(&mut self, action: Destructive) {
+        match action {
+            Destructive::ToggleSession | Destructive::SessionButton => self.set_session(false),
+            Destructive::Escape => {
+                if self.session {
+                    self.set_session(false);
+                } else {
+                    self.push(Command::Quit);
+                }
+            }
+            Destructive::Quit => self.push(Command::Quit),
+        }
+    }
+
+    pub fn clear_pending_destructive(&mut self) {
+        self.pending_destructive = None;
+    }
+
+    /// The confirmation prompt to display, if one is armed and unexpired.
+    pub fn destructive_prompt(&mut self) -> Option<&'static str> {
+        match self.pending_destructive {
+            Some((action, expiry)) if Instant::now() < expiry => Some(action.prompt()),
+            Some(_) => {
+                self.pending_destructive = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub fn show_feedback(&mut self, message: &str) {
+        self.feedback = Some((message.to_string(), Instant::now() + FEEDBACK_DURATION));
+    }
+
+    /// The transient feedback message to display, if unexpired.
+    pub fn feedback_message(&mut self) -> Option<String> {
+        match &self.feedback {
+            Some((message, expiry)) if Instant::now() < *expiry => Some(message.clone()),
+            Some(_) => {
+                self.feedback = None;
+                None
+            }
+            None => None,
+        }
+    }
+
+    // -------------------------------------------------------------- export
+
+    /// Arms the composite-export selection, if there is anything to export.
+    pub fn arm_export(&mut self) {
+        if !self.session {
+            return;
+        }
+        if self.annotations.is_empty() {
+            self.show_feedback("Place an annotation before exporting");
+            return;
+        }
+        self.export_armed = true;
+        self.export_drag.clear();
+        self.show_feedback("Drag a region to copy it with annotations");
+    }
+
+    pub fn cancel_export(&mut self) {
+        self.export_armed = false;
+        self.export_drag.clear();
+    }
+
+    /// Copies the dragged export region, then disarms.
+    pub fn finish_export(&mut self) {
+        let Some(rect) = self.export_drag.rect() else {
+            self.cancel_export();
+            return;
+        };
+        if rect.width < 1.0 || rect.height < 1.0 {
+            self.cancel_export();
+            return;
+        }
+        self.push(Command::CopyRegionImage(rect));
+        self.cancel_export();
+        self.show_feedback("Copied region with annotations");
+    }
+
+    // ------------------------------------------------------------ controls
+
+    /// Sets sensitivity and schedules a re-analysis when it actually changed.
+    pub fn set_sensitivity(&mut self, value: f32) {
+        let clamped = value.clamp(0.0, 100.0);
+        if (clamped - self.sensitivity).abs() < 0.01 {
+            return;
+        }
+        self.sensitivity = clamped;
+        self.push(Command::Recompute);
+    }
+
+    pub fn set_snap_distance(&mut self, value: f32) {
+        self.snap_distance = value.clamp(0.0, SNAP_DISTANCE_MAX);
+    }
+
+    pub fn set_color_radius(&mut self, value: f32) {
+        self.color_radius = value.clamp(0.0, COLOR_RADIUS_MAX);
+    }
+
+    /// Applies a scroll gesture to whichever control the current mode owns.
+    ///
+    /// One wheel notch is one step, so the dial under the cursor responds
+    /// without having to aim at the panel.
+    pub fn adjust_by_wheel(&mut self, notches: f32) {
+        if notches == 0.0 {
+            return;
+        }
+        match self.mode {
+            Mode::RectDrag | Mode::ShrinkToFit => {
+                let next = self.snap_distance + notches;
+                self.set_snap_distance(next);
+            }
+            Mode::ColorPicker => {
+                let next = self.color_radius + notches;
+                self.set_color_radius(next);
+            }
+            _ => {
+                let next = self.sensitivity + notches;
+                self.set_sensitivity(next);
+            }
+        }
+    }
+
+    // --------------------------------------------------------------- quick
+
+    /// Copies the current measurement and quits, the "measure and go" flow.
+    pub fn copy_and_quit(&mut self, crosshair: Option<(f32, f32)>) {
+        let text = self.measurement_text(crosshair);
+        if text.is_empty() {
+            return;
+        }
+        self.push(Command::CopyTextAndQuit(text));
+    }
+
+    /// Toggles the shortcut overlay, cancelling any pending auto-hide.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
+        self.help_auto_hide_at = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> RulerState {
+        RulerState::new(85.0, false)
+    }
+
+    fn point(x: f32, y: f32) -> Point {
+        Point {
+            monitor: 0,
+            x,
+            y,
+        }
+    }
+
+    fn rect_annotation(x: f32, y: f32, width: f32, height: f32) -> Annotation {
+        Annotation {
+            at: point(x, y),
+            mode: Mode::RectDrag,
+            kind: AnnotationKind::Rect { width, height },
+        }
+    }
+
+    #[test]
+    fn mode_indices_match_the_number_key_shortcuts() {
+        assert_eq!(Mode::Crosshair.index(), 0);
+        assert_eq!(Mode::Distance.index(), 5);
+        assert_eq!(Mode::from_index(0), Some(Mode::Crosshair));
+        assert_eq!(Mode::from_index(5), Some(Mode::Distance));
+        assert_eq!(Mode::from_index(6), None);
+        for (i, mode) in Mode::ALL.iter().enumerate() {
+            assert_eq!(mode.index(), i);
+        }
+    }
+
+    #[test]
+    fn switching_mode_drops_only_the_state_that_cannot_carry_over() {
+        let mut s = state();
+        s.container = Some(Rect {
+            monitor: 0,
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        });
+        s.distance_anchor = Some(point(1.0, 2.0));
+        s.drag.has_selection = true;
+
+        s.set_mode(Mode::RectDrag);
+        assert!(s.container.is_none(), "container selection should clear");
+        assert!(s.distance_anchor.is_none(), "distance anchor should clear");
+        assert!(s.drag.has_selection, "rect selection carries into a rect mode");
+
+        // Shrink-to-fit is also a rect mode, so the selection survives.
+        s.set_mode(Mode::ShrinkToFit);
+        assert!(s.drag.has_selection);
+
+        s.set_mode(Mode::Crosshair);
+        assert!(!s.drag.has_selection, "rect selection should clear");
+    }
+
+    #[test]
+    fn size_and_distance_formatting_matches_the_previous_ui() {
+        assert_eq!(format_size(120.0, 40.0), "120 × 40 px");
+        assert_eq!(format_size(-120.4, 40.6), "120 × 41 px");
+        assert_eq!(format_distance(10.0), "10 px");
+        assert_eq!(format_distance(10.25), "10.3 px");
+        assert_eq!(format_distance(10.04), "10 px");
+    }
+
+    #[test]
+    fn distance_summary_adds_a_breakdown_only_when_diagonal() {
+        // Nearly horizontal: dy is below the threshold, so no breakdown.
+        let flat = format_distance_summary(0.0, 0.0, 100.0, 4.0);
+        assert!(flat.starts_with("A(0, 0) → B(100, 4) — "), "{flat}");
+        assert!(!flat.contains('Δ'), "{flat}");
+
+        let diagonal = format_distance_summary(0.0, 0.0, 100.0, 50.0);
+        assert!(diagonal.contains("(Δx=100, Δy=50)"), "{diagonal}");
+    }
+
+    #[test]
+    fn undo_and_redo_walk_the_annotation_history() {
+        let mut s = state();
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(rect_annotation(5.0, 5.0, 20.0, 20.0));
+        assert_eq!(s.annotations.len(), 2);
+
+        assert!(s.undo());
+        assert_eq!(s.annotations.len(), 1);
+        assert!(s.redo());
+        assert_eq!(s.annotations.len(), 2);
+
+        // Nothing left to redo.
+        assert!(!s.redo());
+        assert_eq!(s.annotations.len(), 2);
+    }
+
+    #[test]
+    fn placing_a_new_annotation_discards_the_redo_stack() {
+        let mut s = state();
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        assert!(s.undo());
+        s.add_annotation(rect_annotation(1.0, 1.0, 5.0, 5.0));
+
+        assert!(!s.redo(), "redo should not resurrect a discarded branch");
+        assert_eq!(s.annotations.len(), 1);
+    }
+
+    #[test]
+    fn undo_on_an_empty_history_is_a_no_op() {
+        let mut s = state();
+        assert!(!s.undo());
+        assert!(!s.redo());
+    }
+
+    #[test]
+    fn markdown_export_lists_each_annotation_with_its_anchor() {
+        let mut s = state();
+        s.add_annotation(rect_annotation(12.0, 34.0, 100.0, 50.0));
+        s.add_annotation(Annotation {
+            at: point(5.0, 6.0),
+            mode: Mode::Distance,
+            kind: AnnotationKind::Distance {
+                to_x: 105.0,
+                to_y: 6.0,
+            },
+        });
+
+        let markdown = s.annotations_markdown();
+        let lines: Vec<&str> = markdown.lines().collect();
+        assert_eq!(lines[0], "- Rectangle @ (12, 34): 100 × 50 px");
+        // A distance names both endpoints itself, so it carries no anchor prefix.
+        assert!(lines[1].starts_with("- Distance: A(5, 6) → B(105, 6)"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn markdown_export_of_nothing_is_empty() {
+        assert_eq!(state().annotations_markdown(), "");
+    }
+
+    #[test]
+    fn colour_annotations_export_all_three_notations() {
+        let mut s = state();
+        s.add_annotation(Annotation {
+            at: point(3.0, 4.0),
+            mode: Mode::ColorPicker,
+            kind: AnnotationKind::Color {
+                sample: Sample::from_rgb(230, 25, 94),
+                radius: 0.0,
+            },
+        });
+        let markdown = s.annotations_markdown();
+        assert!(markdown.contains("#E6195E"), "{markdown}");
+        assert!(markdown.contains("rgb(230, 25, 94)"), "{markdown}");
+        assert!(markdown.contains("hsl("), "{markdown}");
+    }
+
+    #[test]
+    fn leaving_session_mode_with_annotations_asks_for_confirmation() {
+        let mut s = state();
+        s.set_session(true);
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+
+        s.request_destructive(Destructive::ToggleSession);
+        assert!(s.session, "first press must not discard anything");
+        assert_eq!(
+            s.destructive_prompt(),
+            Some("Press Tab again to discard annotations")
+        );
+
+        s.request_destructive(Destructive::ToggleSession);
+        assert!(!s.session, "second press confirms");
+        assert!(s.annotations.is_empty());
+    }
+
+    #[test]
+    fn a_different_destructive_action_re_arms_rather_than_confirming() {
+        let mut s = state();
+        s.set_session(true);
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+
+        s.request_destructive(Destructive::ToggleSession);
+        // Pressing Q now must not be treated as confirming the Tab.
+        s.request_destructive(Destructive::Quit);
+        assert!(s.session, "Q must not confirm a pending Tab");
+        assert!(!s.take_commands().contains(&Command::Quit));
+        assert_eq!(
+            s.destructive_prompt(),
+            Some("Press Q again to discard annotations")
+        );
+
+        s.request_destructive(Destructive::Quit);
+        assert!(s.take_commands().contains(&Command::Quit));
+    }
+
+    #[test]
+    fn destructive_actions_run_immediately_when_nothing_would_be_lost() {
+        let mut s = state();
+        s.request_destructive(Destructive::Quit);
+        assert!(s.take_commands().contains(&Command::Quit));
+
+        // In session mode but with no annotations, there is nothing to confirm.
+        let mut s = state();
+        s.set_session(true);
+        s.request_destructive(Destructive::ToggleSession);
+        assert!(!s.session);
+    }
+
+    #[test]
+    fn escape_leaves_session_mode_before_it_quits() {
+        let mut s = state();
+        s.set_session(true);
+        s.request_destructive(Destructive::Escape);
+        assert!(!s.session);
+        assert!(
+            !s.take_commands().contains(&Command::Quit),
+            "escape should exit the session, not the app"
+        );
+
+        s.request_destructive(Destructive::Escape);
+        assert!(s.take_commands().contains(&Command::Quit));
+    }
+
+    #[test]
+    fn sensitivity_changes_schedule_exactly_one_recompute() {
+        let mut s = state();
+        s.set_sensitivity(50.0);
+        assert_eq!(s.take_commands(), vec![Command::Recompute]);
+
+        // An identical value must not trigger redundant re-analysis.
+        s.set_sensitivity(50.0);
+        assert!(s.take_commands().is_empty());
+
+        s.set_sensitivity(-10.0);
+        assert_eq!(s.sensitivity, 0.0);
+        assert_eq!(s.take_commands(), vec![Command::Recompute]);
+    }
+
+    #[test]
+    fn the_wheel_drives_whichever_control_the_mode_owns() {
+        let mut s = state();
+
+        s.set_mode(Mode::Crosshair);
+        s.adjust_by_wheel(5.0);
+        assert_eq!(s.sensitivity, 90.0);
+
+        s.set_mode(Mode::RectDrag);
+        s.adjust_by_wheel(-3.0);
+        assert_eq!(s.snap_distance, DEFAULT_SNAP_DISTANCE - 3.0);
+        assert_eq!(s.sensitivity, 90.0, "sensitivity must not move in rect mode");
+
+        s.set_mode(Mode::ColorPicker);
+        s.adjust_by_wheel(4.0);
+        assert_eq!(s.color_radius, 4.0);
+    }
+
+    #[test]
+    fn control_values_are_clamped_to_their_slider_range() {
+        let mut s = state();
+        s.set_mode(Mode::ColorPicker);
+        s.adjust_by_wheel(1000.0);
+        assert_eq!(s.color_radius, COLOR_RADIUS_MAX);
+        s.adjust_by_wheel(-1000.0);
+        assert_eq!(s.color_radius, 0.0);
+
+        s.set_mode(Mode::RectDrag);
+        s.adjust_by_wheel(1000.0);
+        assert_eq!(s.snap_distance, SNAP_DISTANCE_MAX);
+    }
+
+    #[test]
+    fn quick_copy_emits_nothing_when_there_is_no_measurement() {
+        let mut s = state();
+        s.set_mode(Mode::ColorPicker);
+        s.copy_and_quit(None);
+        assert!(s.take_commands().is_empty());
+
+        s.set_mode(Mode::Crosshair);
+        s.copy_and_quit(Some((100.0, 50.0)));
+        assert_eq!(
+            s.take_commands(),
+            vec![Command::CopyTextAndQuit("100 × 50 px".to_string())]
+        );
+    }
+
+    #[test]
+    fn export_requires_a_session_with_annotations() {
+        let mut s = state();
+        s.arm_export();
+        assert!(!s.export_armed, "export outside a session should be inert");
+
+        s.set_session(true);
+        s.arm_export();
+        assert!(!s.export_armed, "export needs at least one annotation");
+
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.arm_export();
+        assert!(s.export_armed);
+    }
+
+    #[test]
+    fn a_degenerate_export_drag_copies_nothing() {
+        let mut s = state();
+        s.set_session(true);
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.arm_export();
+        let _ = s.take_commands();
+
+        s.export_drag.has_selection = true;
+        s.export_drag.start = (10.0, 10.0);
+        s.export_drag.end = (10.2, 10.2);
+        s.finish_export();
+
+        assert!(!s.export_armed);
+        assert!(
+            !s.take_commands()
+                .iter()
+                .any(|c| matches!(c, Command::CopyRegionImage(_))),
+            "a sub-pixel drag should not produce an image"
+        );
+    }
+
+    #[test]
+    fn a_real_export_drag_requests_the_composite() {
+        let mut s = state();
+        s.set_session(true);
+        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.arm_export();
+        let _ = s.take_commands();
+
+        s.export_drag.has_selection = true;
+        s.export_drag.monitor = 1;
+        s.export_drag.start = (100.0, 80.0);
+        s.export_drag.end = (20.0, 20.0);
+        s.finish_export();
+
+        let commands = s.take_commands();
+        let rect = commands
+            .iter()
+            .find_map(|c| match c {
+                Command::CopyRegionImage(r) => Some(*r),
+                _ => None,
+            })
+            .expect("expected a composite request");
+        // The drag is normalised regardless of its direction.
+        assert_eq!(rect.monitor, 1);
+        assert_eq!((rect.x, rect.y), (20.0, 20.0));
+        assert_eq!((rect.width, rect.height), (80.0, 60.0));
+    }
+
+    #[test]
+    fn drag_rects_normalise_in_every_direction() {
+        let mut drag = DragState {
+            active: false,
+            has_selection: true,
+            monitor: 0,
+            start: (100.0, 100.0),
+            end: (40.0, 30.0),
+        };
+        let rect = drag.rect().expect("selection");
+        assert_eq!((rect.x, rect.y, rect.width, rect.height), (40.0, 30.0, 60.0, 70.0));
+
+        drag.clear();
+        assert!(drag.rect().is_none());
+    }
+}

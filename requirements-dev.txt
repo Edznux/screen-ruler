@@ -1,4 +1,0 @@
-# Development/test dependencies.
-# Includes runtime dependencies plus pytest.
--r requirements.txt
-pytest>=8.0

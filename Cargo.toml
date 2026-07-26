@@ -1,0 +1,58 @@
+[package]
+name = "screen-ruler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Smart edge-detection screen ruler with first-class multi-monitor support"
+license = "MIT"
+repository = "https://github.com/Genymobile/screen-ruler"
+default-run = "screen-ruler"
+
+[[bin]]
+name = "screen-ruler"
+path = "src/main.rs"
+
+[dependencies]
+# Windowing: winit is driven directly (rather than through eframe) so each
+# overlay window can be pinned to a specific monitor with
+# Fullscreen::Borderless(Some(monitor)). eframe's ViewportBuilder cannot
+# express "fullscreen on *this* output", which is exactly what multi-monitor
+# placement needs on Wayland, where clients may not position their own windows.
+winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "rwh_06"] }
+glutin = { version = "0.32", default-features = false, features = ["x11", "wayland", "egl", "glx", "wgl"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["x11", "wayland", "egl", "glx", "wgl"] }
+raw-window-handle = "0.6"
+
+# UI: immediate-mode widgets + an OpenGL painter. No runtime toolkit install.
+egui = { version = "0.33", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.33", default-features = false, features = ["wayland", "x11"] }
+egui_glow = { version = "0.33", default-features = false }
+glow = "0.16"
+
+# Screen capture (X11, Quartz, DXGI) and system clipboard.
+xcap = "0.9"
+arboard = { version = "3.6", default-features = false, features = ["image-data", "wayland-data-control"] }
+
+# Wayland screen capture is implemented natively against wlr-screencopy rather
+# than delegated to xcap, whose shm path fails on wlroots compositors. Both
+# crates are already in the tree via winit, so this costs no extra dependencies.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Edge detection and region labelling are unusably slow in an unoptimised
+# debug build over a 4K screenshot, so always optimise those paths.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

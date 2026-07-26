@@ -4,7 +4,8 @@
 # Usage:
 #   ./install-macos.sh [-d INSTALL_DIR]
 #
-# The script expects a built binary at dist/screen-ruler (run pyinstaller first).
+# The script expects a screen-ruler binary next to it, or one built with
+# `cargo build --release`.
 # It copies the binary to INSTALL_DIR (default: current directory), creates an
 # Automator Quick Action that launches it, and prints instructions for binding
 # a keyboard shortcut in System Settings.
@@ -33,12 +34,23 @@ while getopts "d:h" opt; do
     esac
 done
 
-# --- Locate the built binary ------------------------------------------------
+# --- Locate the binary -------------------------------------------------------
+#
+# Accepts either a release binary downloaded next to this script, or one built
+# locally with `cargo build --release`.
 
-BINARY="$SCRIPT_DIR/dist/screen-ruler"
-if [[ ! -f "$BINARY" ]]; then
-    echo "Error: $BINARY not found."
-    echo "Build it first:  pyinstaller screen_ruler.spec"
+BINARY=""
+for CANDIDATE in "$SCRIPT_DIR/screen-ruler" "$SCRIPT_DIR/target/release/screen-ruler"; do
+    if [[ -f "$CANDIDATE" ]]; then
+        BINARY="$CANDIDATE"
+        break
+    fi
+done
+
+if [[ -z "$BINARY" ]]; then
+    echo "Error: no screen-ruler binary found."
+    echo "Download a release binary next to this script, or build one with:"
+    echo "  cargo build --release"
     exit 1
 fi
 
