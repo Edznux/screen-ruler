@@ -104,6 +104,20 @@ macro_rules! modes {
         /// How many modes there are, and therefore how many number keys bind.
         pub const MODE_COUNT: usize = 0 $(+ modes!(@one $variant))+;
 
+        /// The most dials any one mode declares, and so the most slider rows the
+        /// panel can ever show. Derived from the table so the panel can size
+        /// itself without a heap allocation and without a number to keep in step.
+        pub const MAX_CONTROLS: usize = {
+            let mut max = 0;
+            $(
+                let count = 0 $(+ modes!(@one $control))+;
+                if count > max {
+                    max = count;
+                }
+            )+
+            max
+        };
+
         impl Mode {
             pub const ALL: [Mode; MODE_COUNT] = [$(Mode::$variant),+];
 
@@ -262,6 +276,23 @@ pub struct Annotation {
     pub at: Point,
     pub mode: Mode,
     pub kind: AnnotationKind,
+}
+
+#[cfg(test)]
+impl Annotation {
+    /// A placed rectangle, the simplest annotation to stand in for "some work
+    /// has been done". Shared with the UI tests.
+    pub fn test_rect(x: f32, y: f32, width: f32, height: f32) -> Annotation {
+        Annotation {
+            at: Point {
+                monitor: 0,
+                x,
+                y,
+            },
+            mode: Mode::RectDrag,
+            kind: AnnotationKind::Rect { width, height },
+        }
+    }
 }
 
 impl Annotation {
@@ -872,14 +903,6 @@ mod tests {
         }
     }
 
-    fn rect_annotation(x: f32, y: f32, width: f32, height: f32) -> Annotation {
-        Annotation {
-            at: point(x, y),
-            mode: Mode::RectDrag,
-            kind: AnnotationKind::Rect { width, height },
-        }
-    }
-
     #[test]
     fn mode_indices_match_the_number_key_shortcuts() {
         assert_eq!(Mode::Crosshair.index(), 0);
@@ -1061,8 +1084,8 @@ mod tests {
     #[test]
     fn undo_and_redo_walk_the_annotation_history() {
         let mut s = state();
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
-        s.add_annotation(rect_annotation(5.0, 5.0, 20.0, 20.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(5.0, 5.0, 20.0, 20.0));
         assert_eq!(s.annotations.len(), 2);
 
         assert!(s.undo());
@@ -1078,9 +1101,9 @@ mod tests {
     #[test]
     fn placing_a_new_annotation_discards_the_redo_stack() {
         let mut s = state();
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
         assert!(s.undo());
-        s.add_annotation(rect_annotation(1.0, 1.0, 5.0, 5.0));
+        s.add_annotation(Annotation::test_rect(1.0, 1.0, 5.0, 5.0));
 
         assert!(!s.redo(), "redo should not resurrect a discarded branch");
         assert_eq!(s.annotations.len(), 1);
@@ -1096,7 +1119,7 @@ mod tests {
     #[test]
     fn markdown_export_lists_each_annotation_with_its_anchor() {
         let mut s = state();
-        s.add_annotation(rect_annotation(12.0, 34.0, 100.0, 50.0));
+        s.add_annotation(Annotation::test_rect(12.0, 34.0, 100.0, 50.0));
         s.add_annotation(Annotation {
             at: point(5.0, 6.0),
             mode: Mode::Distance,
@@ -1139,7 +1162,7 @@ mod tests {
     fn leaving_session_mode_with_annotations_asks_for_confirmation() {
         let mut s = state();
         s.set_session(true);
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
 
         s.request_destructive(Destructive::ToggleSession);
         assert!(s.session, "first press must not discard anything");
@@ -1157,7 +1180,7 @@ mod tests {
     fn a_different_destructive_action_re_arms_rather_than_confirming() {
         let mut s = state();
         s.set_session(true);
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
 
         s.request_destructive(Destructive::ToggleSession);
         // Pressing Q now must not be treated as confirming the Tab.
@@ -1273,7 +1296,7 @@ mod tests {
         s.arm_export();
         assert!(!s.export_armed, "export needs at least one annotation");
 
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
         s.arm_export();
         assert!(s.export_armed);
     }
@@ -1282,7 +1305,7 @@ mod tests {
     fn a_degenerate_export_drag_copies_nothing() {
         let mut s = state();
         s.set_session(true);
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
         s.arm_export();
         let _ = s.take_commands();
 
@@ -1304,7 +1327,7 @@ mod tests {
     fn a_real_export_drag_requests_the_composite() {
         let mut s = state();
         s.set_session(true);
-        s.add_annotation(rect_annotation(0.0, 0.0, 10.0, 10.0));
+        s.add_annotation(Annotation::test_rect(0.0, 0.0, 10.0, 10.0));
         s.arm_export();
         let _ = s.take_commands();
 

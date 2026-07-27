@@ -4,7 +4,14 @@
 //! share one [`RulerState`]. A mode switched on one screen is switched
 //! everywhere; annotations stay attached to the display they were placed on.
 
+#[cfg(test)]
+mod harness;
 pub mod help;
+// Only the headless tests read what `layout` reports; see its module docs.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod layout;
+#[cfg(test)]
+mod layout_tests;
 pub mod overlay;
 pub mod panel;
 pub mod theme;
@@ -16,6 +23,7 @@ use egui::{Color32, Context, Key, Pos2, Rect, Vec2};
 use crate::color::KernelCache;
 use crate::state::{Annotation, AnnotationKind, Destructive, Mode, Point, RulerState, HELP_FADE};
 use crate::surface::Surface;
+use crate::ui::layout::ChromeLayout;
 
 /// A drag shorter than this counts as a click, not a selection.
 const DRAG_THRESHOLD: f32 = 2.0;
@@ -138,7 +146,9 @@ pub fn draw(ctx: &Context, frame: FrameContext<'_>) {
             }
 
             handle_input(ctx, ui, state, surface, monitor, active);
-            paint_overlay(ctx, &painter, state, surface, monitor, canvas, active);
+            let shapes = ctx
+                .fonts_mut(|fonts| overlay_shapes(fonts, state, surface, monitor, canvas, active));
+            painter.extend(shapes);
 
             // The panel lives on one monitor at a time and follows the cursor,
             // rather than being duplicated on every screen.
@@ -580,106 +590,103 @@ fn crosshair_size(state: &RulerState, surface: &Surface, monitor: usize) -> Opti
     Some((rays.width(), rays.height()))
 }
 
-/// Draws the measurement marks for the current mode, plus every annotation.
-fn paint_overlay(
-    ctx: &Context,
-    painter: &egui::Painter,
-    state: &mut RulerState,
+/// The measurement marks for the current mode, plus every annotation.
+///
+/// Split out from the painting so it can be inspected without one: this decides
+/// *what* is drawn, which is the part with rules in it. Everything in
+/// [`overlay`] is already shaped this way; this is the composition of them.
+pub fn overlay_shapes(
+    fonts: &mut egui::epaint::text::FontsView<'_>,
+    state: &RulerState,
     surface: &Surface,
     monitor: usize,
     canvas: Vec2,
     active: bool,
-) {
-    let shapes = ctx.fonts_mut(|fonts| {
-        let mut shapes =
-            overlay::annotations_for_monitor(fonts, &state.annotations, monitor, canvas);
+) -> Vec<egui::Shape> {
+    let mut shapes = overlay::annotations_for_monitor(fonts, &state.annotations, monitor, canvas);
 
-        if !active {
-            return shapes;
+    if !active {
+        return shapes;
+    }
+    let Some(pointer) = state.pointer else {
+        return shapes;
+    };
+    let cursor = Pos2::new(pointer.x, pointer.y);
+
+    if state.export_armed {
+        if let Some(rect) = state.export_drag.rect() {
+            shapes.push(overlay::selection_rect(egui_rect(&rect)));
         }
-        let Some(pointer) = state.pointer else {
-            return shapes;
-        };
-        let cursor = Pos2::new(pointer.x, pointer.y);
+        return shapes;
+    }
 
-        if state.export_armed {
-            if let Some(rect) = state.export_drag.rect() {
-                shapes.push(overlay::selection_rect(egui_rect(&rect)));
-            }
-            return shapes;
+    // `state.snapped` is only ever set in a mode that snaps — `set_mode` clears
+    // it on the way out — so the marker needs no per-mode guard of its own. It
+    // used to be listed under `Container`, where it could never appear.
+    if let Some(snapped) = state.snapped {
+        shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
+    }
+
+    match state.mode {
+        Mode::Crosshair => {
+            let rays = surface.rays_at(pointer.x, pointer.y);
+            shapes.extend(overlay::crosshair(
+                cursor,
+                pointer.y - rays.north,
+                pointer.y + rays.south,
+                pointer.x - rays.west,
+                pointer.x + rays.east,
+            ));
+            shapes.extend(overlay::measurement_label(
+                fonts,
+                cursor,
+                &crate::state::format_size(rays.width(), rays.height()),
+                overlay::label_offset(),
+                canvas,
+            ));
         }
-
-        // `state.snapped` is only ever set in a mode that snaps — `set_mode`
-        // clears it on the way out — so the marker needs no per-mode guard of
-        // its own. It used to be listed under `Container`, where it could never
-        // appear, and omitted from nothing that could produce it.
-        if let Some(snapped) = state.snapped {
-            shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
-        }
-
-        match state.mode {
-            Mode::Crosshair => {
-                let rays = surface.rays_at(pointer.x, pointer.y);
-                shapes.extend(overlay::crosshair(
-                    cursor,
-                    pointer.y - rays.north,
-                    pointer.y + rays.south,
-                    pointer.x - rays.west,
-                    pointer.x + rays.east,
-                ));
+        Mode::RectDrag | Mode::ShrinkToFit | Mode::Container => {
+            // `DragState::rect` already reports only a live or finished
+            // selection, so no extra gate is needed here.
+            if let Some(rect) = state.active_rect().or_else(|| state.drag.rect()) {
+                let bounds = egui_rect(&rect);
+                shapes.push(overlay::selection_rect(bounds));
                 shapes.extend(overlay::measurement_label(
                     fonts,
-                    cursor,
-                    &crate::state::format_size(rays.width(), rays.height()),
+                    bounds.min,
+                    &crate::state::format_size(rect.width, rect.height),
                     overlay::label_offset(),
                     canvas,
                 ));
             }
-            Mode::RectDrag | Mode::ShrinkToFit | Mode::Container => {
-                // `DragState::rect` already reports only a live or finished
-                // selection, so no extra gate is needed here.
-                if let Some(rect) = state.active_rect().or_else(|| state.drag.rect()) {
-                    let bounds = egui_rect(&rect);
-                    shapes.push(overlay::selection_rect(bounds));
-                    shapes.extend(overlay::measurement_label(
-                        fonts,
-                        bounds.min,
-                        &crate::state::format_size(rect.width, rect.height),
-                        overlay::label_offset(),
-                        canvas,
-                    ));
-                }
-            }
-            Mode::ColorPicker => {
-                if let Some((at, sample)) = &state.sample {
-                    let at = Pos2::new(at.x, at.y);
-                    shapes.extend(overlay::color_marker(at, state.color_radius));
-                    shapes.extend(overlay::color_bubble(
-                        fonts,
-                        at,
-                        sample.notations(),
-                        Color32::from_rgb(sample.r, sample.g, sample.b),
-                        canvas,
-                    ));
-                }
-            }
-            Mode::Distance => {
-                if let Some(anchor) = state.distance_anchor {
-                    let to = placement_point(state).unwrap_or(pointer);
-                    shapes.extend(overlay::distance(
-                        fonts,
-                        Pos2::new(anchor.x, anchor.y),
-                        Pos2::new(to.x, to.y),
-                        canvas,
-                    ));
-                }
+        }
+        Mode::ColorPicker => {
+            if let Some((at, sample)) = &state.sample {
+                let at = Pos2::new(at.x, at.y);
+                shapes.extend(overlay::color_marker(at, state.color_radius));
+                shapes.extend(overlay::color_bubble(
+                    fonts,
+                    at,
+                    sample.notations(),
+                    Color32::from_rgb(sample.r, sample.g, sample.b),
+                    canvas,
+                ));
             }
         }
+        Mode::Distance => {
+            if let Some(anchor) = state.distance_anchor {
+                let to = placement_point(state).unwrap_or(pointer);
+                shapes.extend(overlay::distance(
+                    fonts,
+                    Pos2::new(anchor.x, anchor.y),
+                    Pos2::new(to.x, to.y),
+                    canvas,
+                ));
+            }
+        }
+    }
 
-        shapes
-    });
-
-    painter.extend(shapes);
+    shapes
 }
 
 /// Draws the controls panel, transient messages and the help overlay, in that
@@ -696,8 +703,18 @@ fn paint_overlay(
 /// prompt appear far down the screen while help was up and then jump upward the
 /// moment help faded — chrome asking a question has to hold still. Help moving
 /// instead is harmless: it is a passive reference that fades on its own.
-fn show_panels(ctx: &Context, state: &mut RulerState, canvas: Vec2, total_edges: usize) {
-    let left = (canvas.x - theme::PANEL_WIDTH) / 2.0;
+fn show_panels(
+    ctx: &Context,
+    state: &mut RulerState,
+    canvas: Vec2,
+    total_edges: usize,
+) -> ChromeLayout {
+    // `PANEL_WIDTH` is the *content* width; the frame adds a margin either side,
+    // so the panel on screen is wider than that. Centring on the content alone
+    // put it half a margin right of the monitor's centre — invisible until the
+    // message chip below it started centring properly and the two disagreed.
+    let panel_width = theme::PANEL_WIDTH + 2.0 * theme::BASE_MARGIN;
+    let left = (canvas.x - panel_width) / 2.0;
 
     let controls = egui::Area::new(egui::Id::new("controls"))
         .fixed_pos(Pos2::new(left, theme::BASE_MARGIN))
@@ -708,9 +725,11 @@ fn show_panels(ctx: &Context, state: &mut RulerState, canvas: Vec2, total_edges:
                 .inner_margin(egui::Margin::symmetric(theme::BASE_MARGIN as i8, 8))
                 .show(ui, |ui| {
                     ui.set_width(theme::PANEL_WIDTH);
-                    panel::show(ui, state, total_edges);
-                });
+                    panel::show(ui, state, total_edges)
+                })
+                .inner
         });
+    let panel_layout = controls.inner;
     let mut next_y = controls.response.rect.bottom() + PANEL_STACK_GAP;
 
     // A pending confirmation outranks passing feedback: it is asking a
@@ -719,25 +738,52 @@ fn show_panels(ctx: &Context, state: &mut RulerState, canvas: Vec2, total_edges:
     let warning = prompt.is_some();
     let message = prompt
         .map(str::to_string)
-        .or_else(|| state.feedback_message());
-    if let Some(message) = message {
-        // `message_bubble` paints in absolute screen coordinates, so the area
-        // itself carries no position — `top` is what places the chip.
-        let chip = egui::Area::new(egui::Id::new("message"))
-            .fixed_pos(Pos2::ZERO)
+        .or_else(|| state.feedback_message())
+        // An empty message is no message: drawing it would reserve a chip-shaped
+        // hole and push the help overlay down for nothing.
+        .filter(|message| !message.is_empty());
+    let message_rect = message.map(|message| {
+        // Measured first, then placed: centring is done here, against the same
+        // `canvas` the panel above is centred on, rather than by `Area::anchor`
+        // — which centres from last frame's size and so slides the chip
+        // sideways for a frame whenever the wording changes length.
+        let chip = panel::measure_message(ctx, &message);
+        let chip_left = ((canvas.x - chip.size.x) / 2.0).max(0.0);
+
+        let area = egui::Area::new(egui::Id::new("message"))
+            .fixed_pos(Pos2::new(chip_left, next_y))
+            // Transient chrome must not eat the input aimed at the screen
+            // behind it: `wants_pointer_input` is true over *any* interactable
+            // area, and `handle_input` bails out on that. The export prompt is
+            // the worst case — it lands exactly where it is telling the user to
+            // start dragging.
+            .interactable(false)
             .show(ctx, |ui| {
-                panel::message_bubble(ui, canvas, next_y, &message, warning)
+                panel::message_bubble(ui, chip, warning);
             });
-        next_y = chip.inner.bottom() + PANEL_STACK_GAP;
-    }
+        next_y = area.response.rect.bottom() + PANEL_STACK_GAP;
+        area.response.rect
+    });
 
     let opacity = help_opacity(state);
-    if opacity > 0.01 {
+    let help_rect = (opacity > 0.01).then(|| {
         egui::Area::new(egui::Id::new("help"))
             .fixed_pos(Pos2::new(left, next_y))
+            // Read-only, like the message chip: it covers a large part of the
+            // screen and has nothing to click.
+            .interactable(false)
             .show(ctx, |ui| {
                 help::show(ui, state, opacity);
-            });
+            })
+            .response
+            .rect
+    });
+
+    ChromeLayout {
+        controls: controls.response.rect,
+        message: message_rect,
+        help: help_rect,
+        panel: panel_layout,
     }
 }
 

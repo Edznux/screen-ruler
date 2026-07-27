@@ -5,7 +5,8 @@ use egui::{
     StrokeKind, Ui, Vec2,
 };
 
-use crate::state::{Mode, RulerState};
+use crate::state::{Control, Mode, RulerState, MAX_CONTROLS, MODE_COUNT};
+use crate::ui::layout::{self, PanelLayout, SliderRow};
 use crate::ui::{overlay, theme};
 
 const BUTTON_CORNER: u8 = 4;
@@ -15,33 +16,58 @@ const BG_HOVER: Color32 = Color32::from_rgba_premultiplied(87, 94, 107, 217);
 const BG_ACTIVE: Color32 = Color32::from_rgba_premultiplied(60, 7, 25, 46);
 
 /// Lays out the panel: the mode row, then the active mode's sliders.
-pub fn show(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
+///
+/// Returns where each widget went, so the layout can be inspected without a
+/// display. See [`crate::ui::layout`].
+pub fn show(ui: &mut Ui, state: &mut RulerState, edge_count: usize) -> PanelLayout {
     ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            let mut mode_clicked = None;
-            for mode in Mode::ALL {
-                if mode_button(ui, mode, state.mode == mode).clicked() {
-                    mode_clicked = Some(mode);
-                }
-            }
-            if let Some(mode) = mode_clicked {
-                state.set_mode(mode);
-            }
+        let (mode_buttons, session_buttons) = mode_row(ui, state);
+        ui.add_space(theme::CONTROLS_COLUMN_SPACING);
+        let sliders = active_sliders(ui, state, edge_count);
 
-            if state.session {
-                ui.add_space(theme::MODE_ROW_SPACING);
-                session_badge(ui, state);
+        PanelLayout {
+            mode_buttons,
+            sliders,
+            session_buttons,
+        }
+    })
+    .inner
+}
+
+/// The row of mode buttons, plus the session badge when there is a session.
+fn mode_row(
+    ui: &mut Ui,
+    state: &mut RulerState,
+) -> (
+    [(Mode, Rect); MODE_COUNT],
+    Option<[Rect; layout::SESSION_BUTTONS]>,
+) {
+    ui.horizontal(|ui| {
+        let mut mode_clicked = None;
+        let mode_buttons = Mode::ALL.map(|mode| {
+            let response = mode_button(ui, mode, state.mode == mode);
+            if response.clicked() {
+                mode_clicked = Some(mode);
             }
+            (mode, response.rect)
+        });
+        if let Some(mode) = mode_clicked {
+            state.set_mode(mode);
+        }
+
+        let session_buttons = state.session.then(|| {
+            ui.add_space(theme::MODE_ROW_SPACING);
+            session_badge(ui, state)
         });
 
-        ui.add_space(theme::CONTROLS_COLUMN_SPACING);
-        active_sliders(ui, state, edge_count);
-    });
+        (mode_buttons, session_buttons)
+    })
+    .inner
 }
 
 /// The `SESSION` badge plus its two export shortcuts.
-fn session_badge(ui: &mut Ui, state: &mut RulerState) {
-    let response = ui.add(
+fn session_badge(ui: &mut Ui, state: &mut RulerState) -> [Rect; layout::SESSION_BUTTONS] {
+    let session = ui.add(
         egui::Button::new(
             egui::RichText::new("SESSION")
                 .color(Color32::WHITE)
@@ -51,25 +77,31 @@ fn session_badge(ui: &mut Ui, state: &mut RulerState) {
         .fill(theme::ACCENT)
         .corner_radius(CornerRadius::same(BUTTON_CORNER)),
     );
-    if response.clicked() {
+    let session_rect = session.rect;
+    if session.clicked() {
         state.request_destructive(crate::state::Destructive::SessionButton);
     }
-    response.on_hover_text("Leave session mode (discards annotations)");
+    session.on_hover_text("Leave session mode (discards annotations)");
 
-    if ui
-        .add(small_button("MD"))
+    let markdown = ui.add(small_button("MD"));
+    let markdown_rect = markdown.rect;
+    if markdown
         .on_hover_text("Copy all annotations as Markdown")
         .clicked()
     {
         state.copy_annotations();
     }
-    if ui
-        .add(small_button("IMG"))
+
+    let image = ui.add(small_button("IMG"));
+    let image_rect = image.rect;
+    if image
         .on_hover_text("Drag a region to copy it with annotations")
         .clicked()
     {
         state.arm_export();
     }
+
+    [session_rect, markdown_rect, image_rect]
 }
 
 fn small_button(label: &'static str) -> egui::Button<'static> {
@@ -88,65 +120,78 @@ fn small_button(label: &'static str) -> egui::Button<'static> {
 /// what the panel shows and what the wheel moves cannot describe different
 /// modes. The wheel drives only the first; the rest are panel-only, which is
 /// why they have to be visible here rather than left implicit.
-fn active_sliders(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
+fn active_sliders(
+    ui: &mut Ui,
+    state: &mut RulerState,
+    edge_count: usize,
+) -> [Option<SliderRow>; MAX_CONTROLS] {
+    // `MAX_CONTROLS` comes from the same table as `controls()`, so the slots
+    // cannot run short.
+    let mut rows = [None; MAX_CONTROLS];
+
     for (index, &control) in state.mode.controls().iter().enumerate() {
         if index > 0 {
             ui.add_space(theme::CONTROLS_ROW_SPACING);
         }
 
-        let value = slider_row(
-            ui,
-            control.title(),
-            state.control_value(control),
-            control.max(),
-            |value| {
-                if control.reports_edges() {
-                    format!("{}  ·  {edge_count} edges", value.round())
-                } else {
-                    format!("{} px", value.round())
-                }
-            },
-        );
-
+        let (value, row) = slider_row(ui, control, state.control_value(control), edge_count);
         state.set_control_value(control, value);
+        rows[index] = Some(row);
     }
+
+    rows
 }
 
-/// One labelled slider row, returning the value the user left it at.
+/// One labelled slider row: the value the user left it at, and where it landed.
 fn slider_row(
     ui: &mut Ui,
-    title: &str,
+    control: Control,
     value: f32,
-    max: f32,
-    readout: impl FnOnce(f32) -> String,
-) -> f32 {
+    edge_count: usize,
+) -> (f32, SliderRow) {
     let mut value = value;
-    ui.horizontal(|ui| {
-        // A fixed label column, so a mode's sliders start at the same x however
-        // long their titles are.
-        let (label, _) = ui.allocate_exact_size(
-            Vec2::new(theme::CONTROL_LABEL_WIDTH, theme::MODE_BUTTON_SIZE / 2.0),
-            Sense::hover(),
-        );
-        ui.painter().text(
-            label.left_center(),
-            Align2::LEFT_CENTER,
-            title,
-            FontId::proportional(theme::TITLE_SIZE),
-            Color32::WHITE,
-        );
-        ui.add(
-            egui::Slider::new(&mut value, 0.0..=max)
-                .show_value(false)
-                .trailing_fill(true),
-        );
-        ui.label(
-            egui::RichText::new(readout(value))
-                .color(Color32::WHITE)
-                .size(theme::VALUE_SIZE),
-        );
-    });
-    value
+    let (label, track) = ui
+        .horizontal(|ui| {
+            // A fixed label column, so a mode's sliders start at the same x
+            // however long their titles are.
+            let (label, _) = ui.allocate_exact_size(
+                Vec2::new(theme::CONTROL_LABEL_WIDTH, theme::MODE_BUTTON_SIZE / 2.0),
+                Sense::hover(),
+            );
+            ui.painter().text(
+                label.left_center(),
+                Align2::LEFT_CENTER,
+                control.title(),
+                FontId::proportional(theme::TITLE_SIZE),
+                Color32::WHITE,
+            );
+            let slider = ui.add(
+                egui::Slider::new(&mut value, 0.0..=control.max())
+                    .show_value(false)
+                    .trailing_fill(true),
+            );
+            let readout = if control.reports_edges() {
+                format!("{}  ·  {edge_count} edges", value.round())
+            } else {
+                format!("{} px", value.round())
+            };
+            ui.label(
+                egui::RichText::new(readout)
+                    .color(Color32::WHITE)
+                    .size(theme::VALUE_SIZE),
+            );
+            (label, slider.rect)
+        })
+        .inner;
+
+    (
+        value,
+        SliderRow {
+            control,
+            label,
+            track,
+        },
+    )
 }
 
 /// One mode button, drawing its icon with the painter rather than shipping assets.
@@ -337,18 +382,39 @@ fn dashed_rect(rect: Rect, stroke: Stroke) -> Vec<Shape> {
 ///
 /// `warning` marks a confirm-before-discard prompt, which carries the accent
 /// border so it reads as a question rather than as passing feedback.
+/// A message chip, laid out but not yet drawn.
 ///
-/// Returns the rectangle it occupied, so the caller can stack below it.
-pub fn message_bubble(ui: &Ui, canvas: Vec2, top: f32, text: &str, warning: bool) -> Rect {
-    if text.is_empty() {
-        return Rect::from_min_size(Pos2::new(canvas.x / 2.0, top), Vec2::ZERO);
-    }
-    let painter = ui.painter();
-    let font = FontId::proportional(theme::VALUE_SIZE);
-    let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
-    let size = overlay::chip_size(galley.size());
-    let rect = Rect::from_min_size(Pos2::new((canvas.x - size.x) / 2.0, top), size);
+/// Measuring is separate from drawing so the caller can centre the chip in the
+/// same frame it appears. Letting the [`egui::Area`] centre it instead means
+/// `Area::anchor`, which positions from the size recorded *last* frame — so a
+/// chip whose text changes length is drawn in the old position for one visible
+/// frame and then snaps sideways, which is exactly what a prompt asking a
+/// question must not do.
+pub struct MessageChip {
+    galley: std::sync::Arc<egui::Galley>,
+    /// Including the chip's padding: what the caller must reserve.
+    pub size: Vec2,
+}
 
+/// Lays out a chip's text so it can be placed before it is painted.
+pub fn measure_message(ctx: &egui::Context, text: &str) -> MessageChip {
+    let galley = ctx.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(
+            text.to_string(),
+            FontId::proportional(theme::VALUE_SIZE),
+            Color32::WHITE,
+        )
+    });
+    let size = overlay::chip_size(galley.size());
+    MessageChip { galley, size }
+}
+
+/// Draws a pre-measured chip, filling the rectangle its size reserved.
+pub fn message_bubble(ui: &mut Ui, chip: MessageChip, warning: bool) {
+    let (rect, _) = ui.allocate_exact_size(chip.size, Sense::hover());
+    let galley = chip.galley;
+
+    let painter = ui.painter();
     painter.rect_filled(rect, theme::corner_radius(), theme::panel_fill());
     if warning {
         painter.rect_stroke(
@@ -359,5 +425,4 @@ pub fn message_bubble(ui: &Ui, canvas: Vec2, top: f32, text: &str, warning: bool
         );
     }
     painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
-    rect
 }

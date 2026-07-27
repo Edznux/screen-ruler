@@ -259,11 +259,12 @@ fn analyse(image: &Rgba8, low: u16, high: u16) -> (EdgeMap, RegionMap) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+impl Surface {
     /// A monitor whose image is a black/white split at image column `split`.
-    fn surface(scale: f32, width: usize, height: usize, split: usize) -> Surface {
+    ///
+    /// Shared with the UI tests, which need something to measure against but
+    /// care only that there is an edge somewhere to find.
+    pub fn test_split(scale: f32, width: usize, height: usize, split: usize) -> Surface {
         let mut pixels = Vec::with_capacity(width * height * 4);
         for _ in 0..height {
             for x in 0..width {
@@ -286,10 +287,15 @@ mod tests {
             regions,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn logical_points_clamp_onto_the_image() {
-        let s = surface(1.0, 64, 48, 32);
+        let s = Surface::test_split(1.0, 64, 48, 32);
         assert_eq!(s.logical_to_pixel(10.0, 10.0), (10, 10));
         assert_eq!(s.logical_to_pixel(-5.0, -5.0), (0, 0));
         assert_eq!(s.logical_to_pixel(9999.0, 9999.0), (63, 47));
@@ -299,8 +305,8 @@ mod tests {
     fn measurements_are_reported_in_logical_pixels() {
         // Same physical panel at 1x and 2x: the logical measurement matches,
         // even though the underlying device-pixel distances differ by 2x.
-        let one_x = surface(1.0, 64, 48, 32);
-        let two_x = surface(2.0, 64, 48, 32);
+        let one_x = Surface::test_split(1.0, 64, 48, 32);
+        let two_x = Surface::test_split(2.0, 64, 48, 32);
 
         let a = one_x.rays_at(10.0, 24.0);
         let b = two_x.rays_at(5.0, 12.0);
@@ -315,7 +321,7 @@ mod tests {
 
     #[test]
     fn snapping_returns_logical_coordinates() {
-        let s = surface(2.0, 64, 48, 32);
+        let s = Surface::test_split(2.0, 64, 48, 32);
         // The edge sits near image column 32, i.e. logical x == 16.
         let (x, _y) = s
             .snap_logical(18.0, 12.0, 5.0)
@@ -325,16 +331,16 @@ mod tests {
 
     #[test]
     fn snapping_with_a_zero_radius_is_disabled() {
-        let s = surface(1.0, 64, 48, 32);
+        let s = Surface::test_split(1.0, 64, 48, 32);
         assert_eq!(s.snap_logical(18.0, 12.0, 0.0), None);
     }
 
     #[test]
     fn desktop_hit_tests_the_monitor_under_a_virtual_point() {
         let mut desktop = Desktop { surfaces: vec![] };
-        let mut left = surface(1.0, 64, 48, 32);
+        let mut left = Surface::test_split(1.0, 64, 48, 32);
         left.geometry.position = (0, 0);
-        let mut right = surface(1.0, 64, 48, 32);
+        let mut right = Surface::test_split(1.0, 64, 48, 32);
         right.geometry.name = "RIGHT".to_string();
         right.geometry.position = (64, 0);
         desktop.surfaces.push(left);
@@ -349,7 +355,7 @@ mod tests {
     #[test]
     fn recomputing_thresholds_changes_the_edge_count() {
         let mut desktop = Desktop {
-            surfaces: vec![surface(1.0, 64, 48, 32)],
+            surfaces: vec![Surface::test_split(1.0, 64, 48, 32)],
         };
         let permissive = desktop.edge_count();
         assert!(permissive > 0);

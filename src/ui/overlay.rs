@@ -16,7 +16,7 @@ use crate::ui::theme;
 /// Gap kept between a floating panel and the screen edge.
 const PANEL_MARGIN: f32 = 2.0;
 /// Length of the end caps on crosshair rays.
-const TICK_HALF_LENGTH: f32 = 5.0;
+pub const TICK_HALF_LENGTH: f32 = 5.0;
 
 /// Places a floating panel near an anchor, flipping it to the other side when
 /// it would overflow the monitor.
