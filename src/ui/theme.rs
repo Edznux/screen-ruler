@@ -29,6 +29,13 @@ pub const EDGE_PREVIEW_PEAK_OPACITY: f32 = 0.5;
 
 pub const PANEL_WIDTH: f32 = 380.0;
 pub const CONTROLS_COLUMN_SPACING: f32 = 8.0;
+/// Gap between two dials of a mode that has more than one.
+pub const CONTROLS_ROW_SPACING: f32 = 4.0;
+/// Fixed width of the slider label column.
+///
+/// Fixed rather than intrinsic so that a mode's sliders line up with each other
+/// instead of stepping sideways with the length of each label.
+pub const CONTROL_LABEL_WIDTH: f32 = 104.0;
 pub const MODE_ROW_SPACING: f32 = 8.0;
 pub const MODE_BUTTON_SIZE: f32 = 30.0;
 

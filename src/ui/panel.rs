@@ -1,11 +1,11 @@
 //! The floating controls panel: mode buttons and the mode's active slider.
 
 use egui::{
-    Color32, CornerRadius, FontId, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind,
-    Ui, Vec2,
+    Align2, Color32, CornerRadius, FontId, Pos2, Rect, Response, Sense, Shape, Stroke,
+    StrokeKind, Ui, Vec2,
 };
 
-use crate::state::{Mode, RulerState, COLOR_RADIUS_MAX, SENSITIVITY_MAX, SNAP_DISTANCE_MAX};
+use crate::state::{Mode, RulerState};
 use crate::ui::{overlay, theme};
 
 const BUTTON_CORNER: u8 = 4;
@@ -14,7 +14,7 @@ const BG: Color32 = Color32::from_rgba_premultiplied(66, 71, 79, 179);
 const BG_HOVER: Color32 = Color32::from_rgba_premultiplied(87, 94, 107, 217);
 const BG_ACTIVE: Color32 = Color32::from_rgba_premultiplied(60, 7, 25, 46);
 
-/// Lays out the panel: the mode row, then the active mode's slider.
+/// Lays out the panel: the mode row, then the active mode's sliders.
 pub fn show(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
@@ -35,7 +35,7 @@ pub fn show(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
         });
 
         ui.add_space(theme::CONTROLS_COLUMN_SPACING);
-        active_slider(ui, state, edge_count);
+        active_sliders(ui, state, edge_count);
     });
 }
 
@@ -82,33 +82,33 @@ fn small_button(label: &'static str) -> egui::Button<'static> {
     .corner_radius(CornerRadius::same(BUTTON_CORNER))
 }
 
-/// The slider the current mode owns, labelled with its value.
+/// One slider per dial the current mode declares, in the declared order.
 ///
-/// Only one is shown at a time: the wheel drives whichever it is, so having a
-/// single visible dial keeps that mapping obvious.
-fn active_slider(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
-    // The dial the mode owns: its label, starting value, range, and whether its
-    // read-out also reports the edge count the threshold produced.
-    let (title, start, max, show_edges) = match state.mode {
-        Mode::RectDrag | Mode::ShrinkToFit => {
-            ("Snap distance", state.snap_distance, SNAP_DISTANCE_MAX, false)
+/// The list comes from [`Mode::controls`], the same lookup the wheel reads, so
+/// what the panel shows and what the wheel moves cannot describe different
+/// modes. The wheel drives only the first; the rest are panel-only, which is
+/// why they have to be visible here rather than left implicit.
+fn active_sliders(ui: &mut Ui, state: &mut RulerState, edge_count: usize) {
+    for (index, &control) in state.mode.controls().iter().enumerate() {
+        if index > 0 {
+            ui.add_space(theme::CONTROLS_ROW_SPACING);
         }
-        Mode::ColorPicker => ("Average", state.color_radius, COLOR_RADIUS_MAX, false),
-        _ => ("Sensitivity", state.sensitivity, SENSITIVITY_MAX, true),
-    };
 
-    let value = slider_row(ui, title, start, max, |value| {
-        if show_edges {
-            format!("{}  ·  {edge_count} edges", value.round())
-        } else {
-            format!("{} px", value.round())
-        }
-    });
+        let value = slider_row(
+            ui,
+            control.title(),
+            state.control_value(control),
+            control.max(),
+            |value| {
+                if control.reports_edges() {
+                    format!("{}  ·  {edge_count} edges", value.round())
+                } else {
+                    format!("{} px", value.round())
+                }
+            },
+        );
 
-    match state.mode {
-        Mode::RectDrag | Mode::ShrinkToFit => state.set_snap_distance(value),
-        Mode::ColorPicker => state.set_color_radius(value),
-        _ => state.set_sensitivity(value),
+        state.set_control_value(control, value);
     }
 }
 
@@ -122,10 +122,18 @@ fn slider_row(
 ) -> f32 {
     let mut value = value;
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(title)
-                .color(Color32::WHITE)
-                .size(theme::TITLE_SIZE),
+        // A fixed label column, so a mode's sliders start at the same x however
+        // long their titles are.
+        let (label, _) = ui.allocate_exact_size(
+            Vec2::new(theme::CONTROL_LABEL_WIDTH, theme::MODE_BUTTON_SIZE / 2.0),
+            Sense::hover(),
+        );
+        ui.painter().text(
+            label.left_center(),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(theme::TITLE_SIZE),
+            Color32::WHITE,
         );
         ui.add(
             egui::Slider::new(&mut value, 0.0..=max)
@@ -170,7 +178,7 @@ fn mode_button(ui: &mut Ui, mode: Mode, active: bool) -> Response {
         painter.add(shape);
     }
 
-    response.on_hover_text(format!("{}  ({})", mode.label(), mode.index() + 1))
+    response.on_hover_text(format!("{}  ({})", mode.label(), mode.digit()))
 }
 
 /// Vector icon for a mode, drawn to fit `rect`.
@@ -320,17 +328,36 @@ fn dashed_rect(rect: Rect, stroke: Stroke) -> Vec<Shape> {
         .collect()
 }
 
-/// Draws a transient message chip centred near the top of the monitor.
-pub fn message_bubble(ui: &Ui, canvas: Vec2, text: &str) {
+/// Draws a transient message chip, horizontally centred with its top at `top`.
+///
+/// The caller places it below the chrome it must not cover, rather than the
+/// chip guessing a fixed offset: the panel grows a row in session mode and the
+/// help overlay comes and goes, so any constant here would eventually collide
+/// with one of them — which is exactly what a hard-coded `y` used to do.
+///
+/// `warning` marks a confirm-before-discard prompt, which carries the accent
+/// border so it reads as a question rather than as passing feedback.
+///
+/// Returns the rectangle it occupied, so the caller can stack below it.
+pub fn message_bubble(ui: &Ui, canvas: Vec2, top: f32, text: &str, warning: bool) -> Rect {
     if text.is_empty() {
-        return;
+        return Rect::from_min_size(Pos2::new(canvas.x / 2.0, top), Vec2::ZERO);
     }
     let painter = ui.painter();
     let font = FontId::proportional(theme::VALUE_SIZE);
     let galley = painter.layout_no_wrap(text.to_string(), font, Color32::WHITE);
     let size = overlay::chip_size(galley.size());
-    let rect = Rect::from_center_size(Pos2::new(canvas.x / 2.0, 64.0), size);
+    let rect = Rect::from_min_size(Pos2::new((canvas.x - size.x) / 2.0, top), size);
 
     painter.rect_filled(rect, theme::corner_radius(), theme::panel_fill());
+    if warning {
+        painter.rect_stroke(
+            rect,
+            theme::corner_radius(),
+            theme::accent_stroke(2.0),
+            StrokeKind::Inside,
+        );
+    }
     painter.galley(rect.center() - galley.size() / 2.0, galley, Color32::WHITE);
+    rect
 }

@@ -19,15 +19,37 @@ use crate::surface::Surface;
 
 /// A drag shorter than this counts as a click, not a selection.
 const DRAG_THRESHOLD: f32 = 2.0;
-/// Number keys that select a mode, in [`Mode::ALL`] order.
-const MODE_KEYS: [Key; 6] = [
-    Key::Num1,
-    Key::Num2,
-    Key::Num3,
-    Key::Num4,
-    Key::Num5,
-    Key::Num6,
-];
+/// Vertical gap between the stacked floating panels.
+const PANEL_STACK_GAP: f32 = 10.0;
+
+/// A single row of number keys is all the mode shortcuts there are, so the
+/// table must stay inside what `mode_digit` can express. Otherwise `--help`
+/// and the button tooltips would advertise a key that cannot be pressed.
+const _: () = assert!(
+    crate::state::MODE_COUNT <= 9,
+    "more modes than the number keys can select — the shortcut scheme needs \
+     rethinking before another mode is added"
+);
+
+/// The `1`-based digit a number key types, whether or not a mode claims it.
+///
+/// Deliberately not an array of the keys that happen to bind today: the digit
+/// goes through [`Mode::from_digit`], so the number keys and [`Mode::ALL`]
+/// cannot fall out of order the way two parallel lists could.
+fn mode_digit(key: Key) -> Option<usize> {
+    Some(match key {
+        Key::Num1 => 1,
+        Key::Num2 => 2,
+        Key::Num3 => 3,
+        Key::Num4 => 4,
+        Key::Num5 => 5,
+        Key::Num6 => 6,
+        Key::Num7 => 7,
+        Key::Num8 => 8,
+        Key::Num9 => 9,
+        _ => return None,
+    })
+}
 
 /// Everything one window needs to render a frame.
 pub struct FrameContext<'a> {
@@ -177,8 +199,10 @@ fn refresh_derived(
         None
     };
 
-    // Snapping only assists the modes that place geometry by hand.
-    state.snapped = if matches!(state.mode, Mode::RectDrag | Mode::Distance) {
+    // Snapping only assists the modes that place geometry by hand, and those
+    // are exactly the modes whose panel dial is the snap distance — one flag on
+    // the mode table, so the dial cannot be offered where it does nothing.
+    state.snapped = if state.mode.snaps() {
         surface
             .snap_logical(pointer.x, pointer.y, state.snap_distance)
             .map(|(x, y)| Point { monitor, x, y })
@@ -300,6 +324,7 @@ fn handle_rect_drag(
         state.drag.monitor = monitor;
         state.drag.start = (anchor.x, anchor.y);
         state.drag.end = (anchor.x, anchor.y);
+        state.drag.press = (pointer.x, pointer.y);
         return;
     }
 
@@ -313,10 +338,7 @@ fn handle_rect_drag(
     }
 
     state.drag.active = false;
-    let moved = (state.drag.end.0 - state.drag.start.0)
-        .abs()
-        .max((state.drag.end.1 - state.drag.start.1).abs());
-    if moved < DRAG_THRESHOLD {
+    if !state.drag.is_drag((pointer.x, pointer.y), DRAG_THRESHOLD) {
         state.drag.has_selection = false;
         return;
     }
@@ -476,12 +498,12 @@ fn handle_keys(ctx: &Context, state: &mut RulerState, surface: &Surface, monitor
     });
 
     for key in keys {
-        // The number keys and `Mode::ALL` are one ordering, not two: the
-        // tooltip shows `mode.index() + 1`, so they cannot be allowed to drift.
-        if let Some(index) = MODE_KEYS.iter().position(|k| *k == key) {
-            if let Some(mode) = Mode::from_index(index) {
+        if let Some(digit) = mode_digit(key) {
+            if let Some(mode) = Mode::from_digit(digit) {
                 state.set_mode(mode);
             }
+            // A digit with no mode behind it is still consumed, so `7` cannot
+            // fall through and be read as some other shortcut later.
             continue;
         }
 
@@ -587,6 +609,14 @@ fn paint_overlay(
             return shapes;
         }
 
+        // `state.snapped` is only ever set in a mode that snaps — `set_mode`
+        // clears it on the way out — so the marker needs no per-mode guard of
+        // its own. It used to be listed under `Container`, where it could never
+        // appear, and omitted from nothing that could produce it.
+        if let Some(snapped) = state.snapped {
+            shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
+        }
+
         match state.mode {
             Mode::Crosshair => {
                 let rays = surface.rays_at(pointer.x, pointer.y);
@@ -606,9 +636,6 @@ fn paint_overlay(
                 ));
             }
             Mode::RectDrag | Mode::ShrinkToFit | Mode::Container => {
-                if let Some(snapped) = state.snapped {
-                    shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
-                }
                 // `DragState::rect` already reports only a live or finished
                 // selection, so no extra gate is needed here.
                 if let Some(rect) = state.active_rect().or_else(|| state.drag.rect()) {
@@ -637,9 +664,6 @@ fn paint_overlay(
                 }
             }
             Mode::Distance => {
-                if let Some(snapped) = state.snapped {
-                    shapes.extend(overlay::snapped_marker(Pos2::new(snapped.x, snapped.y)));
-                }
                 if let Some(anchor) = state.distance_anchor {
                     let to = placement_point(state).unwrap_or(pointer);
                     shapes.extend(overlay::distance(
@@ -658,13 +682,25 @@ fn paint_overlay(
     painter.extend(shapes);
 }
 
-/// Draws the controls panel, help overlay and transient messages.
+/// Draws the controls panel, transient messages and the help overlay, in that
+/// order down the screen.
+///
+/// Each is placed below whatever the one above actually measured, rather than
+/// at a constant: the panel grows a row in session mode and another for a mode
+/// with two dials, so any fixed offset only holds for the layout it was tuned
+/// against. The message chip used to carry one and rendered on top of the
+/// panel.
+///
+/// The message sits *above* the help overlay, not below it, so that its
+/// position depends only on the panel. Stacking it last made a confirmation
+/// prompt appear far down the screen while help was up and then jump upward the
+/// moment help faded — chrome asking a question has to hold still. Help moving
+/// instead is harmless: it is a passive reference that fades on its own.
 fn show_panels(ctx: &Context, state: &mut RulerState, canvas: Vec2, total_edges: usize) {
-    egui::Area::new(egui::Id::new("controls"))
-        .fixed_pos(Pos2::new(
-            (canvas.x - theme::PANEL_WIDTH) / 2.0,
-            theme::BASE_MARGIN,
-        ))
+    let left = (canvas.x - theme::PANEL_WIDTH) / 2.0;
+
+    let controls = egui::Area::new(egui::Id::new("controls"))
+        .fixed_pos(Pos2::new(left, theme::BASE_MARGIN))
         .show(ctx, |ui| {
             egui::Frame::new()
                 .fill(theme::panel_fill())
@@ -675,28 +711,32 @@ fn show_panels(ctx: &Context, state: &mut RulerState, canvas: Vec2, total_edges:
                     panel::show(ui, state, total_edges);
                 });
         });
+    let mut next_y = controls.response.rect.bottom() + PANEL_STACK_GAP;
+
+    // A pending confirmation outranks passing feedback: it is asking a
+    // question, and the feedback that armed it is no longer the useful message.
+    let prompt = state.destructive_prompt();
+    let warning = prompt.is_some();
+    let message = prompt
+        .map(str::to_string)
+        .or_else(|| state.feedback_message());
+    if let Some(message) = message {
+        // `message_bubble` paints in absolute screen coordinates, so the area
+        // itself carries no position — `top` is what places the chip.
+        let chip = egui::Area::new(egui::Id::new("message"))
+            .fixed_pos(Pos2::ZERO)
+            .show(ctx, |ui| {
+                panel::message_bubble(ui, canvas, next_y, &message, warning)
+            });
+        next_y = chip.inner.bottom() + PANEL_STACK_GAP;
+    }
 
     let opacity = help_opacity(state);
     if opacity > 0.01 {
         egui::Area::new(egui::Id::new("help"))
-            .fixed_pos(Pos2::new(
-                (canvas.x - theme::PANEL_WIDTH) / 2.0,
-                theme::BASE_MARGIN + 110.0,
-            ))
+            .fixed_pos(Pos2::new(left, next_y))
             .show(ctx, |ui| {
                 help::show(ui, state, opacity);
-            });
-    }
-
-    let message = state
-        .destructive_prompt()
-        .map(str::to_string)
-        .or_else(|| state.feedback_message());
-    if let Some(message) = message {
-        egui::Area::new(egui::Id::new("message"))
-            .fixed_pos(Pos2::ZERO)
-            .show(ctx, |ui| {
-                panel::message_bubble(ui, canvas, &message);
             });
     }
 }

@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     let options = match cli::parse(std::env::args().skip(1)) {
         cli::Parsed::Run(options) => options,
         cli::Parsed::Help => {
-            print!("{}", cli::USAGE);
+            print!("{}", cli::usage());
             return ExitCode::SUCCESS;
         }
         cli::Parsed::Version => {

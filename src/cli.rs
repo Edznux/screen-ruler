@@ -5,6 +5,7 @@
 //! building on three platforms.
 
 use crate::edges;
+use crate::state::{Mode, MODE_COUNT};
 
 /// Parsed command-line options.
 #[derive(Debug, PartialEq)]
@@ -36,7 +37,36 @@ pub enum Parsed {
     Error(String),
 }
 
-pub const USAGE: &str = "\
+/// The `MODES` block, generated from the mode table rather than transcribed.
+///
+/// This list is the same one the number keys and the button tooltips come from,
+/// so `--help` cannot advertise a mode the app does not have, name it something
+/// the tooltip disagrees with, or number it differently.
+fn modes_block() -> String {
+    let width = Mode::ALL
+        .iter()
+        .map(|mode| mode.label().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    Mode::ALL
+        .iter()
+        .map(|mode| {
+            format!(
+                "    {}  {:width$}  {}",
+                mode.digit(),
+                mode.label(),
+                mode.hint()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The full `--help` text.
+pub fn usage() -> String {
+    format!(
+        "\
 screen-ruler - measure distances between UI edges on any screen
 
 USAGE:
@@ -51,13 +81,8 @@ OPTIONS:
     -h, --help             Show this help.
     -V, --version          Show the version.
 
-MODES (press 1-6)
-    1  Crosshair          Measure to the nearest edges around the cursor
-    2  Drag rectangle     Drag a rectangle, snapping to edges
-    3  Container          Detect the enclosing UI container
-    4  Shrink-to-fit      Drag, then tighten onto the content inside
-    5  Color picker       Sample a colour, optionally averaged
-    6  Point distance     Measure between two points
+MODES (press 1-{last})
+{modes}
 
 KEYS
     Tab            Toggle session mode (persistent annotations)
@@ -69,7 +94,11 @@ KEYS
     Wheel          Adjust the active mode's control
     ? or H         Toggle the shortcut overlay
     Esc / Q        Quit
-";
+",
+        last = MODE_COUNT,
+        modes = modes_block(),
+    )
+}
 
 /// Parses arguments, excluding the program name.
 pub fn parse<I, S>(args: I) -> Parsed
@@ -167,6 +196,17 @@ mod tests {
             Parsed::Run(options) => options,
             other => panic!("expected a run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_help_text_lists_every_mode_with_its_number_key() {
+        let usage = usage();
+        for mode in Mode::ALL {
+            let line = format!("    {}  {}", mode.digit(), mode.label());
+            assert!(usage.contains(&line), "missing {mode:?}:\n{usage}");
+            assert!(usage.contains(mode.hint()), "missing hint for {mode:?}");
+        }
+        assert!(usage.contains(&format!("MODES (press 1-{MODE_COUNT})")), "{usage}");
     }
 
     fn error(args: &[&str]) -> String {

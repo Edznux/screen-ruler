@@ -32,69 +32,183 @@ pub const DEFAULT_SNAP_DISTANCE: f32 = 10.0;
 /// the distance summary and the distance overlay drop their per-axis breakdown.
 pub const DELTA_BREAKDOWN_THRESHOLD: f32 = 8.0;
 
-/// The six measurement modes.
+/// A dial a mode puts on the controls panel.
+///
+/// A mode declares an ordered list of these. The panel shows all of them, and
+/// the wheel drives the first. Modes that snap need two — the snap radius and
+/// the sensitivity that decides whether there is an edge there to snap to — and
+/// an earlier one-dial-per-mode model could not say that, which left point
+/// distance snapping against an edge map it had no way to tune.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Cast rays outward from the cursor to the nearest edges.
-    Crosshair,
-    /// Drag a freehand rectangle.
-    RectDrag,
-    /// Detect the enclosing container under the cursor.
-    Container,
-    /// Drag a rectangle, then tighten it onto the content it encloses.
-    ShrinkToFit,
-    /// Sample a colour under the cursor.
-    ColorPicker,
-    /// Measure between two placed points.
-    Distance,
+pub enum Control {
+    Sensitivity,
+    SnapDistance,
+    ColorRadius,
 }
 
+impl Control {
+    /// Label shown to the left of the slider.
+    pub fn title(self) -> &'static str {
+        match self {
+            Control::Sensitivity => "Sensitivity",
+            Control::SnapDistance => "Snap distance",
+            Control::ColorRadius => "Average",
+        }
+    }
+
+    pub fn max(self) -> f32 {
+        match self {
+            Control::Sensitivity => SENSITIVITY_MAX,
+            Control::SnapDistance => SNAP_DISTANCE_MAX,
+            Control::ColorRadius => COLOR_RADIUS_MAX,
+        }
+    }
+
+    /// True when the read-out also reports how many edges the threshold found.
+    pub fn reports_edges(self) -> bool {
+        matches!(self, Control::Sensitivity)
+    }
+}
+
+/// Declares the measurement modes and everything that varies between them.
+///
+/// One table, one source of truth. The enum, the `1`..`6` shortcut digits, the
+/// panel sliders, the wheel target and the snapping rule all come from it, so
+/// they cannot disagree. They previously did: the same mapping was written out
+/// as four separate `match` arms across three files, and two of them had
+/// drifted — shrink-to-fit offered a snap slider that never applied, and point
+/// distance snapped using a value the panel would not show.
+///
+/// Only facts that genuinely vary per mode belong here. Whether a mode snaps is
+/// *not* one of them: it is exactly "does this mode offer the snap dial", so it
+/// is derived below rather than declared. A column that restates another column
+/// is a column that can contradict it.
+///
+/// Deliberately not in this table either: the button icons. They live in
+/// `ui::panel`, because naming them here would drag drawing code into a module
+/// meant to stay free of it. An exhaustive `match` there keeps them complete.
+macro_rules! modes {
+    (@one $_variant:ident) => { 1usize };
+
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident => controls [$($control:ident),+], rect $rect:literal,
+                          label $label:literal, export $export:literal, hint $hint:literal;
+    )+) => {
+        /// The measurement modes.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Mode {
+            $($(#[$meta])* $variant,)+
+        }
+
+        /// How many modes there are, and therefore how many number keys bind.
+        pub const MODE_COUNT: usize = 0 $(+ modes!(@one $variant))+;
+
+        impl Mode {
+            pub const ALL: [Mode; MODE_COUNT] = [$(Mode::$variant),+];
+
+            /// Zero-based index, matching the `1`..`6` number-key shortcuts.
+            pub fn index(self) -> usize {
+                self as usize
+            }
+
+            /// Inverse of [`Mode::index`].
+            pub fn from_index(index: usize) -> Option<Mode> {
+                Mode::ALL.get(index).copied()
+            }
+
+            /// The mode selected by a `1`-based number key, if that key binds.
+            pub fn from_digit(digit: usize) -> Option<Mode> {
+                Mode::from_index(digit.checked_sub(1)?)
+            }
+
+            /// The number key that selects this mode, as shown in its tooltip.
+            pub fn digit(self) -> usize {
+                self.index() + 1
+            }
+
+            /// Short name, shown on the button tooltip and in the CLI help.
+            pub fn label(self) -> &'static str {
+                match self { $(Mode::$variant => $label,)+ }
+            }
+
+            /// One-line description of what the mode measures, for `--help`.
+            pub fn hint(self) -> &'static str {
+                match self { $(Mode::$variant => $hint,)+ }
+            }
+
+            /// Heading used for this mode in the Markdown export.
+            fn export_title(self) -> &'static str {
+                match self { $(Mode::$variant => $export,)+ }
+            }
+
+            /// The dials this mode puts on the panel, in the order shown.
+            pub fn controls(self) -> &'static [Control] {
+                match self { $(Mode::$variant => &[$(Control::$control),+],)+ }
+            }
+
+            /// True for the modes driven by dragging a rectangle out by hand.
+            pub fn is_rect_selection(self) -> bool {
+                match self { $(Mode::$variant => $rect,)+ }
+            }
+        }
+    };
+}
+
+// The `controls` column is aligned on the first line of each entry on purpose:
+// reading straight down it is how you check that every mode offers the dials
+// its behaviour actually depends on, which is the check two bugs failed.
+//
+// Every snapping mode lists SnapDistance first — the dial the wheel drives, and
+// the one being adjusted most often while placing geometry — then Sensitivity,
+// because a snap radius is useless over an edge map too coarse to find the edge.
+modes! {
+    /// Cast rays outward from the cursor to the nearest edges.
+    Crosshair   => controls [Sensitivity], rect false,
+                   label "Crosshair", export "Crosshair",
+                   hint "Measure to the nearest edges around the cursor";
+
+    /// Drag a freehand rectangle.
+    RectDrag    => controls [SnapDistance, Sensitivity], rect true,
+                   label "Drag rectangle", export "Rectangle",
+                   hint "Drag a rectangle, snapping to edges";
+
+    /// Detect the enclosing container under the cursor.
+    Container   => controls [Sensitivity], rect false,
+                   label "Container detection", export "Rectangle",
+                   hint "Detect the enclosing UI container";
+
+    /// Drag a rectangle, then tighten it onto the content it encloses.
+    ShrinkToFit => controls [SnapDistance, Sensitivity], rect true,
+                   label "Shrink-to-fit", export "Rectangle",
+                   hint "Drag, then tighten onto the content inside";
+
+    /// Sample a colour under the cursor.
+    ColorPicker => controls [ColorRadius], rect false,
+                   label "Color picker", export "Color",
+                   hint "Sample a colour, optionally averaged";
+
+    /// Measure between two placed points.
+    Distance    => controls [SnapDistance, Sensitivity], rect false,
+                   label "Point distance", export "Distance",
+                   hint "Measure between two points";
+}
+
+/// Facts derived from the mode table rather than declared in it.
 impl Mode {
-    pub const ALL: [Mode; 6] = [
-        Mode::Crosshair,
-        Mode::RectDrag,
-        Mode::Container,
-        Mode::ShrinkToFit,
-        Mode::ColorPicker,
-        Mode::Distance,
-    ];
-
-    /// Zero-based index, matching the `1`..`6` number-key shortcuts.
-    pub fn index(self) -> usize {
-        self as usize
+    /// The dial the wheel drives: the first one the mode declares.
+    pub fn primary_control(self) -> Control {
+        // The macro requires at least one control per mode, so this cannot panic.
+        self.controls()[0]
     }
 
-    /// Inverse of [`Mode::index`], and the only place a number key is turned
-    /// into a mode.
-    pub fn from_index(index: usize) -> Option<Mode> {
-        Mode::ALL.get(index).copied()
-    }
-
-    /// Tooltip shown on the mode button.
-    pub fn label(self) -> &'static str {
-        match self {
-            Mode::Crosshair => "Crosshair",
-            Mode::RectDrag => "Drag rectangle",
-            Mode::Container => "Container detection",
-            Mode::ShrinkToFit => "Shrink-to-fit",
-            Mode::ColorPicker => "Color picker",
-            Mode::Distance => "Point distance",
-        }
-    }
-
-    /// Heading used for this mode in the Markdown export.
-    fn export_title(self) -> &'static str {
-        match self {
-            Mode::Crosshair => "Crosshair",
-            Mode::RectDrag | Mode::Container | Mode::ShrinkToFit => "Rectangle",
-            Mode::ColorPicker => "Color",
-            Mode::Distance => "Distance",
-        }
-    }
-
-    /// True for the two modes driven by dragging a rectangle.
-    pub fn is_rect_selection(self) -> bool {
-        matches!(self, Mode::RectDrag | Mode::ShrinkToFit)
+    /// True when the cursor is pulled onto nearby edges in this mode.
+    ///
+    /// Snapping *is* offering the snap-distance dial, so this reads the table
+    /// rather than repeating it: a mode cannot end up snapping with no way to
+    /// tune it, or offering a snap radius that never applies.
+    pub fn snaps(self) -> bool {
+        self.controls().contains(&Control::SnapDistance)
     }
 }
 
@@ -290,9 +404,30 @@ pub struct DragState {
     pub monitor: usize,
     pub start: (f32, f32),
     pub end: (f32, f32),
+    /// Raw cursor position when the button went down, before snapping.
+    ///
+    /// Kept apart from `start` so that "did the user drag or just click?" is
+    /// answered by where the cursor actually went. Measuring it from the
+    /// snapped corners instead makes a real drag that begins and ends inside
+    /// one edge's snap radius collapse to zero length and be thrown away.
+    pub press: (f32, f32),
 }
 
 impl DragState {
+    /// True when the cursor travelled far enough for this to count as a drag
+    /// rather than a click.
+    ///
+    /// Reads `press` — the raw cursor at button-down — deliberately. Answering
+    /// this from `start`/`end` reads the *snapped* corners, and a real drag that
+    /// begins and ends within one edge's snap radius has identical corners, so
+    /// it would be thrown away as a click.
+    pub fn is_drag(&self, pointer: (f32, f32), threshold: f32) -> bool {
+        let moved = (pointer.0 - self.press.0)
+            .abs()
+            .max((pointer.1 - self.press.1).abs());
+        moved >= threshold
+    }
+
     /// The normalised selection, or `None` when nothing is selected.
     pub fn rect(&self) -> Option<Rect> {
         if !self.has_selection && !self.active {
@@ -413,6 +548,13 @@ impl RulerState {
 
         if !mode.is_rect_selection() {
             self.drag.clear();
+        }
+        // The snapped point is recomputed from the cursor once per frame, but a
+        // keyboard mode switch lands *after* that pass and before the overlay is
+        // painted. Clearing here stops a marker left over from the mode being
+        // left showing for a frame in one that never snaps.
+        if !mode.snaps() {
+            self.snapped = None;
         }
         if mode != Mode::Container {
             self.container = None;
@@ -663,28 +805,37 @@ impl RulerState {
         self.color_radius = value.clamp(0.0, COLOR_RADIUS_MAX);
     }
 
-    /// Applies a scroll gesture to whichever control the current mode owns.
+    /// Current value behind a dial, as its panel slider shows it.
+    pub fn control_value(&self, control: Control) -> f32 {
+        match control {
+            Control::Sensitivity => self.sensitivity,
+            Control::SnapDistance => self.snap_distance,
+            Control::ColorRadius => self.color_radius,
+        }
+    }
+
+    /// Writes back a dial, clamped to that dial's own range.
+    pub fn set_control_value(&mut self, control: Control, value: f32) {
+        match control {
+            Control::Sensitivity => self.set_sensitivity(value),
+            Control::SnapDistance => self.set_snap_distance(value),
+            Control::ColorRadius => self.set_color_radius(value),
+        }
+    }
+
+    /// Applies a scroll gesture to the current mode's primary control.
     ///
-    /// One wheel notch is one step, so the dial under the cursor responds
-    /// without having to aim at the panel.
+    /// One wheel notch is one step, so the dial responds without having to aim
+    /// at the panel. Only the first dial is reachable this way: the wheel has
+    /// no second axis to spend, and a modifier-plus-wheel gesture to reach the
+    /// rest would be undiscoverable. The panel shows every dial, so nothing is
+    /// unreachable — just slower to get at.
     pub fn adjust_by_wheel(&mut self, notches: f32) {
         if notches == 0.0 {
             return;
         }
-        match self.mode {
-            Mode::RectDrag | Mode::ShrinkToFit => {
-                let next = self.snap_distance + notches;
-                self.set_snap_distance(next);
-            }
-            Mode::ColorPicker => {
-                let next = self.color_radius + notches;
-                self.set_color_radius(next);
-            }
-            _ => {
-                let next = self.sensitivity + notches;
-                self.set_sensitivity(next);
-            }
-        }
+        let control = self.mode.primary_control();
+        self.set_control_value(control, self.control_value(control) + notches);
     }
 
     // --------------------------------------------------------------- quick
@@ -739,6 +890,126 @@ mod tests {
         for (i, mode) in Mode::ALL.iter().enumerate() {
             assert_eq!(mode.index(), i);
         }
+    }
+
+    #[test]
+    fn number_keys_select_modes_by_digit() {
+        assert_eq!(Mode::from_digit(1), Some(Mode::Crosshair));
+        assert_eq!(Mode::from_digit(6), Some(Mode::Distance));
+        assert_eq!(Mode::from_digit(0), None, "there is no mode 0");
+        assert_eq!(Mode::from_digit(MODE_COUNT + 1), None);
+        for mode in Mode::ALL {
+            assert_eq!(Mode::from_digit(mode.digit()), Some(mode), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn every_mode_declares_usable_controls() {
+        for mode in Mode::ALL {
+            let controls = mode.controls();
+            assert!(!controls.is_empty(), "{mode:?} has no dial at all");
+
+            let mut seen = Vec::new();
+            for control in controls {
+                assert!(
+                    !seen.contains(control),
+                    "{mode:?} lists {control:?} twice, so two sliders would fight \
+                     over one value",
+                );
+                seen.push(*control);
+            }
+        }
+    }
+
+    #[test]
+    fn every_snapping_mode_can_reach_both_dials_snapping_depends_on() {
+        // Snapping needs two things the user can get wrong: a radius, and an
+        // edge map coarse enough to have found the edge. Offering only one of
+        // them strands the mode — point distance shipped with exactly that,
+        // snapping against a sensitivity it had no way to raise.
+        for mode in Mode::ALL.into_iter().filter(|mode| mode.snaps()) {
+            let controls = mode.controls();
+            assert_eq!(
+                controls.first(),
+                Some(&Control::SnapDistance),
+                "{mode:?} snaps, so the wheel should drive its snap radius",
+            );
+            assert!(
+                controls.contains(&Control::Sensitivity),
+                "{mode:?} snaps against the edge map but cannot tune it: {controls:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn point_distance_can_adjust_the_snapping_it_actually_uses() {
+        // Regression: distance mode snapped the cursor using `snap_distance`,
+        // while both the panel slider and the wheel edited sensitivity.
+        let mut s = state();
+        s.set_mode(Mode::Distance);
+        assert!(Mode::Distance.snaps());
+
+        s.adjust_by_wheel(-4.0);
+        assert_eq!(s.snap_distance, DEFAULT_SNAP_DISTANCE - 4.0);
+        assert_eq!(s.sensitivity, 85.0, "the wheel drives only the first dial");
+
+        // ...but sensitivity is still on the panel, so it is reachable.
+        s.set_control_value(Control::Sensitivity, 30.0);
+        assert_eq!(s.sensitivity, 30.0);
+    }
+
+    #[test]
+    fn shrink_to_fit_snaps_like_the_dial_it_offers() {
+        // Regression: it showed a snap-distance slider, but snapping was never
+        // applied in that mode, so the control was inert.
+        assert!(Mode::ShrinkToFit.snaps());
+        assert_eq!(Mode::ShrinkToFit.primary_control(), Control::SnapDistance);
+    }
+
+    #[test]
+    fn leaving_a_snapping_mode_drops_the_snapped_point() {
+        // Regression: the snapped point outlived the mode that produced it for
+        // one frame, because a keyboard mode switch lands after the pass that
+        // recomputes it, and the marker was painted in between.
+        let mut s = state();
+        s.set_mode(Mode::RectDrag);
+        s.snapped = Some(point(10.0, 10.0));
+
+        s.set_mode(Mode::Crosshair);
+        assert!(s.snapped.is_none(), "a non-snapping mode must not inherit it");
+
+        // Between two snapping modes it is still valid, so it survives.
+        s.set_mode(Mode::RectDrag);
+        s.snapped = Some(point(10.0, 10.0));
+        s.set_mode(Mode::Distance);
+        assert!(s.snapped.is_some());
+    }
+
+    #[test]
+    fn the_wheel_drives_the_primary_dial_and_writes_reach_the_named_one() {
+        let mut s = state();
+        s.sensitivity = 40.0;
+        s.snap_distance = 12.0;
+        s.color_radius = 6.0;
+
+        for (mode, expected) in [
+            (Mode::Crosshair, 40.0),
+            (Mode::RectDrag, 12.0),
+            (Mode::Container, 40.0),
+            (Mode::ShrinkToFit, 12.0),
+            (Mode::ColorPicker, 6.0),
+            (Mode::Distance, 12.0),
+        ] {
+            s.set_mode(mode);
+            let primary = mode.primary_control();
+            assert_eq!(s.control_value(primary), expected, "{mode:?}");
+        }
+
+        // A write lands on the named dial, clamped to that dial's own range.
+        s.set_mode(Mode::ColorPicker);
+        s.set_control_value(Control::ColorRadius, COLOR_RADIUS_MAX + 10.0);
+        assert_eq!(s.color_radius, COLOR_RADIUS_MAX);
+        assert_eq!(s.snap_distance, 12.0, "other dials must not move");
     }
 
     #[test]
@@ -1058,6 +1329,31 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_is_judged_by_the_cursor_not_the_snapped_corners() {
+        // Regression: with snapping on, a real drag whose ends both land on the
+        // same edge pixel has `start == end`. Judging it from those corners
+        // reported "no movement" and silently discarded the selection, so short
+        // drags started next to a UI edge did nothing at all.
+        let drag = DragState {
+            active: true,
+            has_selection: false,
+            monitor: 0,
+            press: (100.0, 100.0),
+            // Both corners snapped onto the same edge pixel.
+            start: (96.0, 96.0),
+            end: (96.0, 96.0),
+        };
+
+        assert!(
+            drag.is_drag((100.0, 112.0), 2.0),
+            "a 12 px drag is a drag however its corners snapped",
+        );
+        assert!(!drag.is_drag((101.0, 101.0), 2.0), "a 1 px wobble is a click");
+        // Exactly at the threshold counts, so the boundary is not a dead zone.
+        assert!(drag.is_drag((102.0, 100.0), 2.0));
+    }
+
+    #[test]
     fn drag_rects_normalise_in_every_direction() {
         let mut drag = DragState {
             active: false,
@@ -1065,6 +1361,7 @@ mod tests {
             monitor: 0,
             start: (100.0, 100.0),
             end: (40.0, 30.0),
+            press: (100.0, 100.0),
         };
         let rect = drag.rect().expect("selection");
         assert_eq!((rect.x, rect.y, rect.width, rect.height), (40.0, 30.0, 60.0, 70.0));
